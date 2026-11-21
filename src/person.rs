@@ -57,6 +57,9 @@ struct Out {
     covered: Vec<u64>,
     person: u64,
     buf: Vec<u8>,
+    /// The ID of `buf` zero-padded, when it fits; the categories likewise.
+    id: [u8; 16],
+    cat16: Vec<[u8; 16]>,
     rows: Rows,
     cells: Vec<Cell>,
     /// `[campaign][day]` assisted sessions; merged into `cells` at the end.
@@ -127,6 +130,8 @@ impl<'a> Worker<'a> {
                 covered: vec![0; ctx.ncamp],
                 person: 0,
                 buf: Vec::new(),
+                id: [0; 16],
+                cat16: ctx.cats.iter().map(|c| { let mut a = [0; 16]; for (d, &s) in a.iter_mut().zip(c) { *d = s; } a }).collect(),
                 rows: Rows::default(),
                 cells: vec![Cell::default(); (ctx.ncamp + 1) * ctx.ndays],
                 assisted: vec![0; ctx.ncamp * ctx.ndays],
@@ -394,10 +399,13 @@ fn order_bins(cks: &mut [[u64; 2]]) {
 /// earlier bin's last event to the later bin's first is over 30 minutes.
 fn person(ctx: &Ctx, o: &mut Out, pk: Key, evs: &[u64], cks: &[[u64; 2]]) {
     o.sessions.clear();
-    o.day_first.clear();
     o.person += 1;
     o.buf.clear();
     key::decode(pk, &mut o.buf);
+    o.id = [0; 16];
+    for (d, &s) in o.id.iter_mut().zip(&o.buf) {
+        *d = s;
+    }
     let (mut day, mut sessions, mut events, mut rev) = (i32::MIN, 0u32, 0u32, 0i64);
     let mut prev_hi = 0u32;
 
@@ -425,9 +433,6 @@ fn person(ctx: &Ctx, o: &mut Out, pk: Key, evs: &[u64], cks: &[[u64; 2]]) {
             }
             sessions += 1;
             let di = (d as i64 - ctx.day0) as u32;
-            while o.day_first.len() <= di as usize {
-                o.day_first.push(o.sessions.len() as u32);
-            }
             o.sessions.push(Sess { start: lo, day: di, rev: 0 });
         }
         events += count;
@@ -443,9 +448,6 @@ fn person(ctx: &Ctx, o: &mut Out, pk: Key, evs: &[u64], cks: &[[u64; 2]]) {
         prev_hi = hi;
     }
     flush(ctx, o, day, sessions, events, rev);
-    while o.day_first.len() <= ctx.ndays {
-        o.day_first.push(o.sessions.len() as u32);
-    }
     attribute(ctx, o, cks);
 }
 
@@ -466,16 +468,37 @@ fn flush(ctx: &Ctx, o: &mut Out, day: i32, sessions: u32, events: u32, rev: i64)
     }
     o.touched.clear();
     let r = &mut o.rows;
-    parquet::put_str(&mut r.ids, &o.buf);
+    if o.buf.len() <= 16 {
+        put16(&mut r.ids, o.id, o.buf.len());
+    } else {
+        parquet::put_str(&mut r.ids, &o.buf);
+    }
     r.day.push(day);
     r.sessions.push(sessions as i32);
     r.events.push(events as i32);
     r.revenue.push(rev);
     r.present.push(top != NONE);
     if top != NONE {
-        parquet::put_str(&mut r.tops, &ctx.cats[top as usize]);
+        let c = &ctx.cats[top as usize];
+        if c.len() <= 16 {
+            put16(&mut r.tops, o.cat16[top as usize], c.len());
+        } else {
+            parquet::put_str(&mut r.tops, c);
+        }
     }
     r.n += 1;
+}
+
+/// A PLAIN BYTE_ARRAY value of `len <= 16` bytes from a padded copy: one store each for the length and the bytes.
+#[inline(always)]
+fn put16(out: &mut Vec<u8>, v: [u8; 16], len: usize) {
+    out.reserve(20);
+    unsafe {
+        let p = out.as_mut_ptr().add(out.len());
+        p.cast::<u32>().write_unaligned(len as u32);
+        p.add(4).cast::<[u8; 16]>().write_unaligned(v);
+        out.set_len(out.len() + 4 + len);
+    }
 }
 
 /// Credit each session to the latest click in [start - 7d, start] (ties: smallest click_id, which sorts last),
@@ -509,6 +532,15 @@ fn attribute(ctx: &Ctx, o: &mut Out, cks: &[[u64; 2]]) {
             cell.revenue += s.rev as i64;
         }
         return;
+    }
+    o.day_first.clear();
+    for (i, s) in o.sessions.iter().enumerate() {
+        while o.day_first.len() <= s.day as usize {
+            o.day_first.push(i as u32);
+        }
+    }
+    while o.day_first.len() <= ndays {
+        o.day_first.push(n as u32);
     }
     let (mut lo, mut hi) = (0, 0);
     for s in &o.sessions {
