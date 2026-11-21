@@ -51,7 +51,7 @@ fn prefetch(p: *const u8) {
 impl Links {
     pub fn build(edges: &[Vec<(Key, Key)>], threads: usize) -> Links {
         let n: usize = edges.iter().map(|e| e.len()).sum();
-        let cap = (n * 4).next_power_of_two().max(16); // slots: at most 2 IDs per edge, at most half full
+        let cap = (n * 3).next_power_of_two().max(16); // slots: about 1.4 IDs per edge in practice (2 at most)
         let lines = cap / 4;
         let mask = lines - 1;
         let shift = 64 - lines.trailing_zeros();
