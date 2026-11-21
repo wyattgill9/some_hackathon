@@ -360,6 +360,14 @@ fn numbered(id: &[u8], prefix: &[u8]) -> Option<usize> {
     Some(n)
 }
 
+/// A campaign ID of any other spelling through the exact map; out of line so the probe does not weigh on
+/// the click path (about 1 in 200 clicks comes here).
+#[cold]
+#[inline(never)]
+fn campaign_slow(camp_of: &U64Map, camp: &[u8]) -> Option<u32> {
+    camp_of.get(unsafe { key::pack16(camp.as_ptr(), camp.len()) })
+}
+
 /// `numbered(id, b"c_")` for a field in the reader's buffer: the digits go through the SWAR parser.
 ///
 /// # Safety
@@ -554,7 +562,7 @@ fn parse_click<'a>(mut f: impl Fields<'a>, ctx: &Ctx, camp_of: &U64Map, camp_num
     let camp = f.next();
     let camp = match unsafe { campaign_number(camp) }.and_then(|n| camp_num.get(n)).copied() {
         Some(i) if i != 0 => i - 1,
-        _ => camp_of.get(unsafe { key::pack16(camp.as_ptr(), camp.len()) })?,
+        _ => campaign_slow(camp_of, camp)?,
     };
     let ts = f.next();
     let t = unsafe { tc.parse_raw(ts.as_ptr(), ts.len()) }.filter(|&t| t >= ctx.cws && t < ctx.we)?;
