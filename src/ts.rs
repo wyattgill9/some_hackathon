@@ -39,6 +39,16 @@ impl TsCache {
         if len == 20 && b[19] == b'Z' {
             return Some(self.date(b)? + time_of_day(&b[11..19])?);
         }
+        if len == 13 {
+            // F3 of today's length: its first five digits behind three zero bytes, and its last eight.
+            const Z: u64 = 0x3030_3030_3030_3030;
+            let a = unsafe { ((p as *const u64).read_unaligned() << 24) ^ (Z << 24) };
+            let b = unsafe { (p.add(5) as *const u64).read_unaligned() ^ Z };
+            if let (Some(a), Some(b)) = (digits8(a), digits8(b)) {
+                return Some((a * 100_000_000 + b) as i64);
+            }
+            return None;
+        }
         if len.wrapping_sub(1) < 16 {
             if let Some(v) = unsafe { digits16(p, len) } {
                 return Some(v);
@@ -165,7 +175,12 @@ unsafe fn digits16(p: *const u8, len: usize) -> Option<i64> {
 
 #[inline(always)]
 fn eight(w: u64) -> Option<u64> {
-    let x = w ^ 0x3030_3030_3030_3030;
+    digits8(w ^ 0x3030_3030_3030_3030)
+}
+
+/// Eight digit values (byte 0 the most significant, each 0..=9 after the xor with '0') as a number.
+#[inline(always)]
+fn digits8(x: u64) -> Option<u64> {
     if (x.wrapping_add(0x7676_7676_7676_7676) | x) & 0x8080_8080_8080_8080 != 0 {
         return None;
     }
