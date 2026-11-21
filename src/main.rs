@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use key::{Key, mix};
+use key::Key;
 use parquet::{Column, Enc, Kind};
 use person::Cell;
 use pool::Pool;
@@ -29,23 +29,29 @@ use u64map::U64Map;
 pub const DAY: i64 = 86_400_000;
 pub const WEEK: i64 = 7 * DAY;
 pub const GAP: i64 = 1_800_000;
+/// Staging bytes per partition of the event streams and of the click stream (see pool.rs).
+const EV_STAGE: usize = 64;
+const CK_STAGE: usize = 192;
 
-/// A parsed event copy, 28 bytes. Times are relative to `cws` (window_start - 7 d): `ts` in ms, `ingest` in
-/// seconds biased by 2^31. `pay` = price | category << 24 for a purchase, else 0, with bit 31 = valid and not
-/// late (categories therefore use 7 bits).
+/// A parsed event copy as the parser builds it: the dedup key (`eid`, `ingest` in ms since the epoch) and the
+/// payload, which go to two parallel record streams of the event's partition.
 #[derive(Clone, Copy)]
-#[repr(C, packed)]
-pub struct Ev {
-    eid: Key,
-    person: Key,
-    ingest: u32,
-    ts: u32,
-    pay: u32,
+struct Ev {
+    key: EvKey,
+    pay: Ev2,
 }
 
-const VALID: u32 = 1 << 31;
+/// What dedup compares: copies of an event share `eid`; the one with the smallest `ingest` wins.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct EvKey {
+    eid: Key,
+    ingest: i64,
+}
 
-/// A surviving event.
+/// An event's payload, and a surviving event. `person` is 0 when the copy is invalid or late (a valid event's
+/// user ID is never empty). `ts` is in ms relative to `cws` (window_start - 7 d). `pay` = price | category << 24
+/// for a purchase, else 0.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct Ev2 {
@@ -54,7 +60,7 @@ pub struct Ev2 {
     pub pay: u32,
 }
 
-/// A valid click.
+/// A valid click, 24 bytes: eight per three staging lines.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct Ck {
@@ -68,7 +74,6 @@ pub struct Ctx {
     pub ws: i64,
     pub we: i64,
     pub cws: i64,
-    pub cws_s: i64,
     pub day0: i64,
     pub ndays: usize,
     pub bits: u32,
@@ -152,7 +157,7 @@ fn main() {
     // 128 KiB ranges: a thread's read buffer plus its open partition stages must share a 1 MiB L2 with its
     // SMT sibling on the scorer (neutral on a private-L2 desktop).
     let range = env("SS_RANGE").unwrap_or(128 << 10);
-    let ctx = Ctx { ws, we, cws, cws_s: cws.div_euclid(1000), day0, ndays, bits, ncamp, cats: cats.iter().map(|c| c.to_vec()).collect(), unknown };
+    let ctx = Ctx { ws, we, cws, day0, ndays, bits, ncamp, cats: cats.iter().map(|c| c.to_vec()).collect(), unknown };
     fs::create_dir_all(out.join("user_daily")).unwrap();
     fs::create_dir_all(out.join("campaign_daily")).unwrap();
     lap("setup");
@@ -176,7 +181,7 @@ fn main() {
     let mut tasks: Vec<(bool, Range)> = reader::ranges(&event_files, range).into_iter().map(|r| (true, r)).collect();
     tasks.extend(reader::ranges(&click_files, range).into_iter().map(|r| (false, r)));
     let next = AtomicUsize::new(0);
-    let parsed: Vec<(Pool<Ev>, Pool<Ck>)> = parallel(threads, |_| {
+    let parsed: Vec<(Pool<EvKey, EV_STAGE>, Pool<Ev2, EV_STAGE>, Pool<Ck, CK_STAGE>)> = parallel(threads, |_| {
         let mut rd = Reader::default();
         let mut w = Parser {
             ctx: &ctx,
@@ -185,8 +190,8 @@ fn main() {
             camp_num: &camp_num,
             links: &links,
             tc: TsCache::default(),
-            evs: Pool::<Ev>::new(parts),
-            cks: Pool::<Ck>::new(parts),
+            evs: (Pool::new(parts), Pool::new(parts)),
+            cks: Pool::new(parts),
             epipe: Pipe::default(),
             cpipe: Pipe::default(),
         };
@@ -201,20 +206,30 @@ fn main() {
         }
         w.finish()
     });
-    let (evs, cks): (Vec<Pool<Ev>>, Vec<Pool<Ck>>) = parsed.into_iter().unzip();
+    let (mut evk, mut evp, mut cks) = (Vec::new(), Vec::new(), Vec::new());
+    for (k, p, c) in parsed {
+        evk.push(k);
+        evp.push(p);
+        cks.push(c);
+    }
     lap("parse");
-    // Dedup per event partition: keep the copy with the smallest ingest_ts, emit it if valid, by person.
+    // Dedup per event partition: keep the copy with the smallest ingest_ts, emit it if valid, by person. The
+    // output blocks are carved from the partition's consumed input blocks.
     let next = AtomicUsize::new(0);
-    let ev2: Vec<Pool<Ev2>> = parallel(threads, |_| {
-        let (mut filter, mut suspects) = (Vec::new(), Vec::new());
-        let mut out = Pool::<Ev2>::new(parts);
+    let ev2: Vec<Pool<Ev2, EV_STAGE>> = parallel(threads, |_| {
+        let (mut table, mut dropped) = (Vec::new(), Vec::new());
+        let mut out = Pool::<Ev2, EV_STAGE>::new(parts);
         loop {
             let p = next.fetch_add(1, Ordering::Relaxed);
             if p >= parts {
                 break;
             }
-            let blocks: Vec<&[Ev]> = evs.iter().flat_map(|t| t.blocks(p)).collect();
-            dedup(&blocks, &mut filter, &mut suspects, bits, &mut out);
+            let keys: Vec<&[EvKey]> = evk.iter().flat_map(|t| t.blocks(p)).collect();
+            let pays: Vec<&[Ev2]> = evp.iter().flat_map(|t| t.blocks(p)).collect();
+            dedup(&keys, &pays, &mut table, &mut dropped, bits, &mut out);
+            for b in keys.iter().map(|b| b.as_ptr() as *mut u8).chain(pays.iter().map(|b| b.as_ptr() as *mut u8)) {
+                out.recycle(b);
+            }
         }
         out.finish();
         out
@@ -292,7 +307,8 @@ fn main() {
     // Nothing is dropped; the big mappings are released on all threads so exit does not tear them down on one.
     // process::exit (libc exit), not _exit: the PGO-instrumented build writes its profile from an atexit handler.
     parallel(threads, |t| {
-        evs[t].release();
+        evk[t].release();
+        evp[t].release();
         cks[t].release();
         ev2[t].release();
         if t == 0 {
@@ -382,36 +398,38 @@ struct Parser<'a> {
     camp_num: &'a [u32],
     links: &'a links::Links,
     tc: TsCache,
-    evs: Pool<Ev>,
-    cks: Pool<Ck>,
+    evs: (Pool<EvKey, EV_STAGE>, Pool<Ev2, EV_STAGE>),
+    cks: Pool<Ck, CK_STAGE>,
     epipe: Pipe<Ev>,
     cpipe: Pipe<Ck>,
 }
 
 impl Parser<'_> {
+    /// The key and payload streams of the event's partition, pushed as a pair.
     #[inline(always)]
-    fn emit_ev(&mut self, mut e: Ev) {
-        e.person = self.links.lookup(e.person);
-        let eid = e.eid;
-        self.evs.push(key::part(eid, self.ctx.bits), e);
+    fn emit_ev(&mut self, e: Ev) {
+        let p = key::part(e.key.eid, self.ctx.bits);
+        // The payload is built in registers: a wide load of a record patched in memory would wait for the patch.
+        let pay = Ev2 { person: self.links.lookup(e.pay.person), ts: e.pay.ts, pay: e.pay.pay };
+        self.evs.0.push2(&mut self.evs.1, p, e.key, pay);
     }
 
     #[inline(always)]
-    fn emit_ck(&mut self, mut c: Ck) {
-        c.person = self.links.lookup(c.person);
-        self.cks.push(key::part(c.person, self.ctx.bits), c);
+    fn emit_ck(&mut self, c: Ck) {
+        let person = self.links.lookup(c.person);
+        self.cks.push(key::part(person, self.ctx.bits), Ck { person, cid: c.cid, ts: c.ts, camp: c.camp });
     }
 
-    fn finish(mut self) -> (Pool<Ev>, Pool<Ck>) {
+    fn finish(mut self) -> (Pool<EvKey, EV_STAGE>, Pool<Ev2, EV_STAGE>, Pool<Ck, CK_STAGE>) {
         for e in self.epipe.drain().collect::<Vec<_>>() {
             self.emit_ev(e);
         }
         for c in self.cpipe.drain().collect::<Vec<_>>() {
             self.emit_ck(c);
         }
-        self.evs.finish();
+        self.evs.0.finish2(&mut self.evs.1);
         self.cks.finish();
-        (self.evs, self.cks)
+        (self.evs.0, self.evs.1, self.cks)
     }
 }
 
@@ -419,7 +437,7 @@ impl Handler<7> for Parser<'_> {
     #[inline(always)]
     fn line<'a>(&mut self, f: impl Fields<'a>) {
         if let Some(e) = parse_event(f, self.ctx, self.cat_of, &mut self.tc) {
-            self.links.prefetch(e.person);
+            self.links.prefetch(e.pay.person);
             if let Some(old) = self.epipe.push(e) {
                 self.emit_ev(old);
             }
@@ -510,12 +528,8 @@ fn parse_event<'a>(mut f: impl Fields<'a>, ctx: &Ctx, cat_of: &U64Map, tc: &mut 
         }
     }
     Some(Ev {
-        eid,
-        person: if valid { ukey } else { 0 },
-        // F1 is whole seconds, so / is exact; biased by 2^31 so copies compare right for ±68 years.
-        ingest: (ing / 1000 - ctx.cws_s + (1 << 31)).clamp(0, u32::MAX as i64) as u32,
-        ts: t.map_or(0, |t| (t - ctx.cws) as u32),
-        pay: pay | if valid { VALID } else { 0 },
+        key: EvKey { eid, ingest: ing },
+        pay: Ev2 { person: if valid { ukey } else { 0 }, ts: t.map_or(0, |t| (t - ctx.cws) as u32), pay },
     })
 }
 
@@ -538,51 +552,127 @@ fn parse_click<'a>(mut f: impl Fields<'a>, ctx: &Ctx, camp_of: &U64Map, camp_num
     Some(Ck { person: ukey, cid, ts: (t - ctx.cws) as u32, camp })
 }
 
-/// One event partition, read in place from its blocks. A two-bit counter per hash slot (32 slots per copy)
-/// tells which event_ids were seen more than once: the others, nearly all of them, are emitted straight from
-/// the second pass; the suspects are sorted by event_id and the copy with the smallest ingest of each wins.
-/// Valid winners go to their person's partition. Copies with equal ingest are identical, so ties are immaterial.
-fn dedup(blocks: &[&[Ev]], filter: &mut Vec<u64>, suspects: &mut Vec<Ev>, bits: u32, out: &mut Pool<Ev2>) {
-    let n: usize = blocks.iter().map(|b| b.len()).sum();
+/// A line of the dedup table: a count, then 15 slots of `tag << 20 | position`, filled in order.
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+pub struct TLine([u32; 16]);
+
+/// A record's position in its partition: block index << 10 | index in the block (blocks hold at most 1024).
+const POS_BITS: u32 = 20;
+const POS_MASK: u32 = (1 << POS_BITS) - 1;
+
+/// One event partition: the key stream and the payload stream, parallel, read in place from their blocks.
+/// The key pass walks every (event_id, ingest) through an open-addressing table whose lines of 15 slots are
+/// probed with one compare each: a copy whose event_id is already in the table loses to the copy there or
+/// replaces it, and the loser's position goes into a bitmap. The payload pass then copies every valid,
+/// undropped payload to its person's partition. Copies with equal ingest are identical, so ties are immaterial.
+fn dedup(keys: &[&[EvKey]], pays: &[&[Ev2]], table: &mut Vec<TLine>, dropped: &mut Vec<u64>, bits: u32, out: &mut Pool<Ev2, EV_STAGE>) {
+    let n: usize = keys.iter().map(|b| b.len()).sum();
     if n == 0 {
         return;
     }
-    let slots = (n * 32).next_power_of_two().max(64);
-    let shift = 64 - slots.trailing_zeros();
-    filter.clear();
-    filter.resize(slots / 32, 0);
-    for r in blocks.iter().flat_map(|b| b.iter()) {
-        let h = ((mix(r.eid) << bits) >> shift) as usize;
-        let (w, sh) = (&mut filter[h >> 5], (h & 31) * 2);
-        let seen = (*w >> sh) & 1;
-        *w |= (1 | seen << 1) << sh;
-    }
-    let emit = |r: Ev, out: &mut Pool<Ev2>| {
-        if r.pay & VALID != 0 {
-            out.push(key::part(r.person, bits), Ev2 { person: r.person, ts: r.ts, pay: r.pay & !VALID });
-        }
-    };
-    suspects.clear();
-    for r in blocks.iter().flat_map(|b| b.iter()) {
-        let h = ((mix(r.eid) << bits) >> shift) as usize;
-        if (filter[h >> 5] >> ((h & 31) * 2)) & 2 != 0 {
-            suspects.push(*r);
-        } else {
-            emit(*r, out);
-        }
-    }
-    suspects.sort_unstable_by_key(|r| r.eid);
-    let mut k = 0;
-    while k < suspects.len() {
-        let mut best = suspects[k];
-        k += 1;
-        while k < suspects.len() && suspects[k].eid == best.eid {
-            if suspects[k].ingest < best.ingest {
-                best = suspects[k];
+    debug_assert!(keys.len() == pays.len() && keys.iter().zip(pays).all(|(k, p)| k.len() == p.len()));
+    dropped.clear();
+    dropped.resize(keys.len() << (10 - 6), 0);
+    if keys.len() > 1 << (POS_BITS - 10) {
+        dedup_big(keys, dropped);
+    } else {
+        // Lines of 15 slots at a load of 33-67%: a line is rarely full, and then the next one is probed.
+        let lines = (n / 10).next_power_of_two().max(2);
+        // The line is the top bits of a second multiply (the partition is the top bits of key::part's), the
+        // tag the 12 below them.
+        let lsh = 64 - lines.trailing_zeros();
+        let tsh = lsh - 12;
+        table.clear();
+        table.resize(lines, TLine([0; 16]));
+        for (b, blk) in keys.iter().enumerate() {
+            for (j, r) in blk.iter().enumerate() {
+                let pos = (b << 10 | j) as u32;
+                let h = r.eid.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                let tag = (h >> tsh) as u32 & 0xfff | 1;
+                let mut li = (h >> lsh) as usize & (lines - 1);
+                // In bounds: li is masked, positions come from this walk, and the table is never full.
+                unsafe {
+                    loop {
+                        let line = table.as_mut_ptr().add(li);
+                        let mut found = probe(line, tag);
+                        while found != 0 {
+                            let s = found.trailing_zeros() as usize;
+                            let q = (*line).0[s] & POS_MASK;
+                            let other = keys.get_unchecked(q as usize >> 10).get_unchecked(q as usize & 1023);
+                            if other.eid == r.eid {
+                                let loser = if r.ingest < other.ingest {
+                                    (*line).0[s] = tag << POS_BITS | pos;
+                                    q
+                                } else {
+                                    pos
+                                };
+                                *dropped.get_unchecked_mut(loser as usize >> 6) |= 1 << (loser & 63);
+                                break;
+                            }
+                            found &= found - 1;
+                        }
+                        if found != 0 {
+                            break;
+                        }
+                        let count = (*line).0[0] as usize;
+                        if count < 15 {
+                            (*line).0[count + 1] = tag << POS_BITS | pos;
+                            (*line).0[0] = count as u32 + 1;
+                            break;
+                        }
+                        li = (li + 1) & (lines - 1);
+                    }
+                }
             }
-            k += 1;
         }
-        emit(best, out);
+    }
+    for (b, blk) in pays.iter().enumerate() {
+        for (c, chunk) in blk.chunks(64).enumerate() {
+            let mut word = dropped[b << 4 | c];
+            for e in chunk {
+                let keep = (e.person != 0) & (word & 1 == 0);
+                word >>= 1;
+                if keep {
+                    out.push(key::part(e.person, bits), *e);
+                }
+            }
+        }
+    }
+}
+
+/// The slots of `line` holding `tag`, as a bit mask (bit 0, the count, never matches: tags are nonzero).
+#[inline(always)]
+unsafe fn probe(line: *const TLine, tag: u32) -> u32 {
+    #[cfg(target_feature = "avx2")]
+    unsafe {
+        use std::arch::x86_64::*;
+        let lo = _mm256_load_si256(line as *const __m256i);
+        let hi = _mm256_load_si256((line as *const __m256i).add(1));
+        let t = _mm256_set1_epi32((tag << POS_BITS) as i32);
+        let m = _mm256_set1_epi32(!POS_MASK as i32);
+        _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(_mm256_and_si256(lo, m), t))) as u32
+            | (_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(_mm256_and_si256(hi, m), t))) as u32) << 8
+    }
+    #[cfg(not(target_feature = "avx2"))]
+    unsafe {
+        let mut f = 0;
+        for (s, &v) in (*line).0.iter().enumerate() {
+            f |= ((v >> POS_BITS == tag) as u32) << s;
+        }
+        f
+    }
+}
+
+/// A partition too large for 20-bit positions (over a million copies): every key sorted, losers marked.
+#[cold]
+fn dedup_big(keys: &[&[EvKey]], dropped: &mut Vec<u64>) {
+    let mut all: Vec<(Key, i64, usize)> = keys.iter().enumerate().flat_map(|(b, blk)| blk.iter().enumerate().map(move |(j, r)| (r.eid, r.ingest, b << 10 | j))).collect();
+    all.sort_unstable();
+    for w in all.windows(2) {
+        if w[0].0 == w[1].0 {
+            dropped[w[1].2 >> 6] |= 1 << (w[1].2 & 63);
+        }
     }
 }
 
