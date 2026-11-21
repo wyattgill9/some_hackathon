@@ -1,0 +1,32 @@
+[package]
+name = "shopping-sessions"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# No dependencies on purpose: the scorer builds this with the network on, but a
+# build that needs nothing from crates.io cannot be broken by it.
+[dependencies]
+
+[[bin]]
+name = "pipeline"
+path = "src/main.rs"
+
+# The slow, literal reading of rules.md. Never shipped in the image: it is the
+# oracle the fast pipeline is diffed against on seeds that have no published answer.
+[[bin]]
+name = "reference"
+path = "ref/reference.rs"
+
+# A stand-in dataset generator for benchmarks on CI, where the organizers'
+# generator is not available. Never shipped in the image.
+[[bin]]
+name = "synth"
+path = "src/bin/synth.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false

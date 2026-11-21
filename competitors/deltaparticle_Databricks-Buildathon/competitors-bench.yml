@@ -1,0 +1,68 @@
+name: competitors
+
+# Build each candidate repo from its own Dockerfile, run it with scorer flags on
+# a generated 20M-event set alternating with our shipped image on the same
+# machine, and diff its output against ours. Candidate code runs only here,
+# with a read-only token.
+on:
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: "Space-separated owner/repo list"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  list:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        run: |
+          python3 -c "import json,sys; print('matrix=' + json.dumps(sys.argv[1].split()))" "${{ github.event.inputs.repos }}" >> "$GITHUB_OUTPUT"
+
+  bench:
+    needs: list
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        repo: ${{ fromJSON(needs.list.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ours and data
+        run: |
+          lscpu | grep "Model name"
+          cargo build --release -q --manifest-path tools/gen-lowmem/Cargo.toml
+          tools/gen-lowmem/target/release/generate --seed 42 --events 20000000 --clicks 5000000 --output "$RUNNER_TEMP/p20" 2>&1 | tail -1
+          docker build -q -t ours .
+          pip install --quiet polars
+      - name: Candidate
+        run: |
+          set +e
+          git clone -q --depth 1 "https://github.com/${{ matrix.repo }}" cand && (cd cand && git log --oneline -1)
+          timeout 900 docker build -q -t cand cand > build.log 2>&1; echo "build exit $?"; tail -5 build.log
+          run() {
+            img=$1; out=$(mktemp -d); scratch=$(mktemp -d); chmod 777 "$out" "$scratch"
+            s=$(date +%s.%N)
+            docker run --rm --network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL --security-opt no-new-privileges \
+              --pids-limit 4096 --cpus "$(nproc)" --memory 14g --memory-swap 14g --user 1000:1000 \
+              -v "$RUNNER_TEMP/p20":/data:ro -v "$out":/output -v "$scratch":/scratch \
+              -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch -e NCPU="$(nproc)" -e MEM_GB=14 "$img" > /dev/null 2>&1
+            code=$?; e=$(date +%s.%N)
+            echo "$img exit=$code wall=$(python3 -c "print(round($e-$s,3))")" | tee -a times.txt
+            echo "$out" > "last_$img"
+          }
+          for i in 1 2 3 4; do run ours; run cand; done
+          echo "output vs ours: $(cd scripts && python3 compare.py "$(cat ../last_cand)" "$(cat ../last_ours)" | tail -1)"
+          python3 - <<'PY'
+          import statistics as st
+          rows = [l.split() for l in open("times.txt")]
+          for img in ("ours", "cand"):
+              w = [float(r[2][5:]) for r in rows if r[0] == img and r[1] == "exit=0"]
+              print(f"{img}: median wall {st.median(w):.3f}s n={len(w)}" if w else f"{img}: no successful runs")
+          PY
