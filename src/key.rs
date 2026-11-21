@@ -135,7 +135,15 @@ fn intern(id: &[u8]) -> Key {
     INTERNED | i as u64
 }
 
-/// A 64-bit mixer for partitioning and hashing keys (use the top bits).
+/// The partition of a key: the top `bits` of a Fibonacci multiply. The parse pushes (events by event_id,
+/// clicks by person) and dedup's push of surviving events (by person) must agree, so this is the one place
+/// a partition is computed.
+#[inline(always)]
+pub fn part(k: Key, bits: u32) -> usize {
+    (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - bits)) as usize
+}
+
+/// A 64-bit mixer for hashing keys within a partition (use the top bits).
 #[inline]
 pub fn mix(k: u64) -> u64 {
     let x = (k ^ (k >> 32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);

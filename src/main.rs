@@ -386,13 +386,13 @@ impl Parser<'_> {
     fn emit_ev(&mut self, mut e: Ev) {
         e.person = self.links.lookup(e.person);
         let eid = e.eid;
-        self.evs.push((mix(eid) >> (64 - self.ctx.bits)) as usize, e);
+        self.evs.push(key::part(eid, self.ctx.bits), e);
     }
 
     #[inline(always)]
     fn emit_ck(&mut self, mut c: Ck) {
         c.person = self.links.lookup(c.person);
-        self.cks.push((mix(c.person) >> (64 - self.ctx.bits)) as usize, c);
+        self.cks.push(key::part(c.person, self.ctx.bits), c);
     }
 
     fn finish(mut self) -> (Pool<Ev>, Pool<Ck>) {
@@ -552,7 +552,7 @@ fn dedup(blocks: &[&[Ev]], filter: &mut Vec<u64>, suspects: &mut Vec<Ev>, bits: 
     }
     let emit = |r: Ev, out: &mut Pool<Ev2>| {
         if r.pay & VALID != 0 {
-            out.push((mix(r.person) >> (64 - bits)) as usize, Ev2 { person: r.person, ts: r.ts, pay: r.pay & !VALID });
+            out.push(key::part(r.person, bits), Ev2 { person: r.person, ts: r.ts, pay: r.pay & !VALID });
         }
     };
     suspects.clear();
