@@ -56,9 +56,25 @@ pub struct Reader {
     index: Index,
 }
 
+/// A well-formed line: its fields are read on demand, so a parser only pays for the ones it looks at.
+pub struct Line<'a> {
+    buf: &'a [u8],
+    starts: [u32; 8],
+    lens: [u32; 8],
+}
+
+impl<'a> Line<'a> {
+    /// Field `i`, unquoted.
+    #[inline(always)]
+    pub fn get(&self, i: usize) -> &'a [u8] {
+        // In bounds: the split produced the positions from delimiters inside the buffer.
+        unsafe { std::slice::from_raw_parts(self.buf.as_ptr().add(self.starts[i] as usize), self.lens[i] as usize) }
+    }
+}
+
 impl Reader {
-    /// Calls `f` with the fields of every well-formed N-field line the range owns, in order.
-    pub fn fields<const N: usize>(&mut self, file: &File, r: &Range, mut f: impl FnMut([&[u8]; N])) {
+    /// Calls `f` with every well-formed N-field line the range owns, in order.
+    pub fn fields<const N: usize>(&mut self, file: &File, r: &Range, mut f: impl FnMut(&Line)) {
         let from = r.start.saturating_sub(1);
         let owned_end = (r.end - from) as usize; // data index of file offset r.end
         let mut want = owned_end + TAIL;
@@ -103,9 +119,7 @@ impl Reader {
                 // In bounds: the delimiter positions are < n, FRONT bytes precede the data and PAD follow it.
                 let (starts, lens, wrapped) = unsafe { split::<N>(dp, idx.delims.as_ptr().add(d)) };
                 if q1 - q0 == wrapped {
-                    f(std::array::from_fn(|i| unsafe {
-                        std::slice::from_raw_parts(dp.add(starts[i] as usize), lens[i] as usize)
-                    }));
+                    f(&Line { buf: data, starts, lens });
                 }
                 d += N;
                 q0 = q1;
@@ -204,7 +218,7 @@ mod tests {
         let mut out = Vec::new();
         let mut rd = Reader::default();
         for r in ranges(&files, target) {
-            rd.fields::<N>(&files[0].0, &r, |l| out.push(l.iter().map(|f| f.to_vec()).collect()));
+            rd.fields::<N>(&files[0].0, &r, |l| out.push((0..N).map(|i| l.get(i).to_vec()).collect()));
         }
         out
     }

@@ -21,7 +21,7 @@ use key::{Key, mix};
 use parquet::{Column, Kind};
 use person::Cell;
 use pool::Pool;
-use reader::{Range, Reader};
+use reader::{Line, Range, Reader};
 use ts::TsCache;
 use u64map::U64Map;
 
@@ -67,6 +67,7 @@ pub struct Ctx {
     pub ws: i64,
     pub we: i64,
     pub cws: i64,
+    pub cws_s: i64,
     pub day0: i64,
     pub ndays: usize,
     pub bits: u32,
@@ -128,7 +129,7 @@ fn main() {
     let bits = env("SS_PBITS").map_or(((event_bytes >> 21).next_power_of_two().trailing_zeros()).clamp(4, 11), |b| b as u32);
     let parts = 1usize << bits;
     let range = env("SS_RANGE").unwrap_or(256 << 10);
-    let ctx = Ctx { ws, we, cws, day0, ndays, bits, ncamp, cats: cats.iter().map(|c| c.to_vec()).collect(), unknown };
+    let ctx = Ctx { ws, we, cws, cws_s: cws.div_euclid(1000), day0, ndays, bits, ncamp, cats: cats.iter().map(|c| c.to_vec()).collect(), unknown };
     fs::create_dir_all(out.join("user_daily")).unwrap();
     fs::create_dir_all(out.join("campaign_daily")).unwrap();
     lap("setup");
@@ -141,7 +142,8 @@ fn main() {
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             let Some(r) = link_ranges.get(i) else { break out };
-            rd.fields::<2>(&link_files[r.file].0, r, |[a, b]| {
+            rd.fields::<2>(&link_files[r.file].0, r, |l| {
+                let (a, b) = (l.get(0), l.get(1));
                 if !a.is_empty() && !b.is_empty() {
                     let (ka, kb) = (key::pack(a), key::pack(b));
                     if ka != kb {
@@ -355,29 +357,35 @@ impl<T: Copy> Pipe<T> {
 /// Fills `e` from a line; false if the line yields no copy. Its `person` is still the user ID: the caller
 /// resolves it through the link table.
 #[inline(always)]
-fn parse_event([id, user, ts, ingest, kind, product, price]: [&[u8]; 7], ctx: &Ctx, cat_of: &U64Map, tc: &mut TsCache, e: &mut Ev) -> bool {
+fn parse_event(l: &Line, ctx: &Ctx, cat_of: &U64Map, tc: &mut TsCache, e: &mut Ev) -> bool {
+    let id = l.get(0);
     if id.is_empty() {
         return false;
     }
+    let (user, ts, ingest, kind) = (l.get(1), l.get(2), l.get(3), l.get(4));
     // Fields point into the reader's buffer, which keeps 64 readable bytes past the data.
-    let t = unsafe { tc.parse_raw(ts.as_ptr(), ts.len()) }.filter(|t| (ctx.ws..ctx.we).contains(t));
+    let t = unsafe { tc.parse_raw(ts.as_ptr(), ts.len()) }.filter(|&t| t >= ctx.ws && t < ctx.we);
     // ponytail: rules.md guarantees ingest_ts is valid F1; a bad one sorts last and fails the late check.
     let ing = unsafe { tc.parse_raw(ingest.as_ptr(), ingest.len()) }.unwrap_or(i64::MAX);
-    let mut valid = !user.is_empty()
-        && !product.is_empty()
-        && matches!(kind, b"view" | b"cart" | b"purchase")
-        && t.is_some_and(|t| ing - t <= DAY);
+    let purchase = kind.len() == 8 && u64::from_le_bytes(kind.try_into().unwrap()) == u64::from_le_bytes(*b"purchase");
+    let kind_ok = purchase
+        || (kind.len() == 4 && {
+            let k = u32::from_le_bytes(kind.try_into().unwrap());
+            k == u32::from_le_bytes(*b"view") || k == u32::from_le_bytes(*b"cart")
+        });
+    let product = l.get(5);
+    let mut valid = !user.is_empty() && !product.is_empty() && kind_ok && t.is_some_and(|t| ing - t <= DAY);
     let mut pay = 0;
-    if valid && kind == b"purchase" {
-        match parse::price(price) {
+    if valid && purchase {
+        match parse::price(l.get(6)) {
             Some(v) => pay = v | cat_of.get(unsafe { key::pack16(product.as_ptr(), product.len()) }).unwrap_or(ctx.unknown) << 24,
             None => valid = false,
         }
     }
-    // Fields point into the reader's buffer, which keeps 64 readable bytes past the data.
     e.eid = unsafe { key::pack16(id.as_ptr(), id.len()) };
     e.person = if valid { unsafe { key::pack16(user.as_ptr(), user.len()) } } else { 0 };
-    e.ingest = (ing.div_euclid(1000) - ctx.cws.div_euclid(1000) + (1 << 31)).clamp(0, u32::MAX as i64) as u32;
+    // F1 is whole seconds, so / is exact; biased by 2^31 so copies compare right for ±68 years.
+    e.ingest = (ing / 1000 - ctx.cws_s + (1 << 31)).clamp(0, u32::MAX as i64) as u32;
     e.ts = t.map_or(0, |t| (t - ctx.cws) as u32);
     e.pay = pay | if valid { VALID } else { 0 };
     true
@@ -385,11 +393,12 @@ fn parse_event([id, user, ts, ingest, kind, product, price]: [&[u8]; 7], ctx: &C
 
 /// The click's `person` is still its user ID: the caller resolves it through the link table.
 #[inline]
-fn parse_click([id, user, camp, ts]: [&[u8]; 4], ctx: &Ctx, camp_of: &U64Map, tc: &mut TsCache) -> Option<Ck> {
+fn parse_click(l: &Line, ctx: &Ctx, camp_of: &U64Map, tc: &mut TsCache) -> Option<Ck> {
+    let (id, user, camp, ts) = (l.get(0), l.get(1), l.get(2), l.get(3));
     if id.is_empty() || user.is_empty() {
         return None;
     }
-    let t = unsafe { tc.parse_raw(ts.as_ptr(), ts.len()) }.filter(|t| (ctx.cws..ctx.we).contains(t))?;
+    let t = unsafe { tc.parse_raw(ts.as_ptr(), ts.len()) }.filter(|&t| t >= ctx.cws && t < ctx.we)?;
     let camp = camp_of.get(unsafe { key::pack16(camp.as_ptr(), camp.len()) })?;
     Some(Ck {
         person: unsafe { key::pack16(user.as_ptr(), user.len()) },
