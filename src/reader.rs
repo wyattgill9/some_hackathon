@@ -8,7 +8,7 @@ use std::path::Path;
 
 use crate::scan::Index;
 
-const TAIL: usize = 64 << 10;
+const TAIL: usize = 8 << 10;
 const PAD: usize = 64;
 
 pub struct Range {
@@ -102,15 +102,12 @@ impl Reader {
                 let mut wrapped = 0;
                 for (i, o) in out.iter_mut().enumerate() {
                     // In bounds: the index ends in SENTINELS entries past any d + N, and positions are < n.
-                    let fld = unsafe {
+                    // The bytes at a and b - 1 are the field's ends, or its delimiters when it is empty.
+                    unsafe {
                         let (a, b) = (*idx.delims.get_unchecked(d + i) as usize + 1, *idx.delims.get_unchecked(d + i + 1) as usize);
-                        buf.get_unchecked(a..b)
-                    };
-                    if fld.len() >= 2 && fld[0] == b'"' && fld[fld.len() - 1] == b'"' {
-                        wrapped += 1;
-                        *o = &fld[1..fld.len() - 1];
-                    } else {
-                        *o = fld;
+                        let w = ((b - a >= 2) & (*buf.get_unchecked(a) == b'"') & (*buf.get_unchecked(b - 1) == b'"')) as usize;
+                        wrapped += w;
+                        *o = buf.get_unchecked(a + w..b - w);
                     }
                 }
                 if quotes == 2 * wrapped {

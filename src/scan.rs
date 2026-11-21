@@ -24,9 +24,9 @@ impl Index {
         while o < n {
             let (d, l, q) = masks(&buf[o..o + 64]);
             let valid = if n - o >= 64 { u64::MAX } else { (1u64 << (n - o)) - 1 };
-            flatten(d & valid, o, &mut self.delims);
-            flatten(l & valid, o, &mut self.nl);
-            flatten(q & valid, o, &mut self.quotes);
+            flatten::<12>(d & valid, o, &mut self.delims);
+            flatten::<4>(l & valid, o, &mut self.nl);
+            flatten::<4>(q & valid, o, &mut self.quotes);
             o += 64;
         }
         self.delims.extend(std::iter::repeat_n(u32::MAX, SENTINELS));
@@ -35,18 +35,29 @@ impl Index {
     }
 }
 
+/// Appends the position of every set bit. The first N slots are written unconditionally (a cleared mask
+/// yields harmless values past the end), so the usual block costs no data-dependent branch.
 #[inline]
-fn flatten(mut m: u64, o: usize, out: &mut Vec<u32>) {
+fn flatten<const N: usize>(mut m: u64, o: usize, out: &mut Vec<u32>) {
     out.reserve(64);
     let (base, p) = (out.len(), out.as_mut_ptr());
-    let mut n = 0;
-    while m != 0 {
-        // In bounds: at most 64 bits are set and 64 slots were reserved.
-        unsafe { p.add(base + n).write((o + m.trailing_zeros() as usize) as u32) };
-        n += 1;
-        m &= m - 1;
+    let cnt = m.count_ones() as usize;
+    // In bounds: at most 64 bits are set and 64 slots were reserved.
+    unsafe {
+        for i in 0..N {
+            p.add(base + i).write((o + m.trailing_zeros() as usize) as u32);
+            m &= m.wrapping_sub(1);
+        }
+        if cnt > N {
+            let mut i = N;
+            while m != 0 {
+                p.add(base + i).write((o + m.trailing_zeros() as usize) as u32);
+                m &= m - 1;
+                i += 1;
+            }
+        }
+        out.set_len(base + cnt);
     }
-    unsafe { out.set_len(base + n) };
 }
 
 /// Bit i set where block[i] is a delimiter (`,` or `\n`), a newline, a quote.
