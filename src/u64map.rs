@@ -12,7 +12,9 @@ pub struct U64Map {
 impl U64Map {
     pub fn new(expected: usize) -> Self {
         let cap = (expected * 2).next_power_of_two().max(16);
-        U64Map { keys: vec![0; cap], vals: vec![0; cap], mask: cap - 1, len: 0 }
+        // Written pages, not calloc: lookups read every slot, and reading a calloc page before writing it
+        // maps the zero page, which the insert then copies (and flushes TLBs for).
+        U64Map { keys: crate::mem::zeroed(cap), vals: crate::mem::zeroed(cap), mask: cap - 1, len: 0 }
     }
 
     #[inline]

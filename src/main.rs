@@ -3,6 +3,7 @@
 //! (by event_id, by person) -> dedup per event partition -> sessions and attribution per person partition.
 mod key;
 mod links;
+mod mem;
 mod parquet;
 mod parse;
 mod person;
@@ -78,7 +79,18 @@ pub struct Ctx {
 
 fn main() {
     let t0 = Instant::now();
-    let lap = |what: &str| eprintln!("{:>8.3}s {what}", t0.elapsed().as_secs_f64());
+    // Never trim malloc heaps: a thread's freed memory would be given back (MADV_DONTNEED) and then re-faulted by
+    // the next phase's thread on the same arena, page by page, each fault flushing every thread's TLB (20M
+    // events: 16k faults and 11k TLB-shootdown IPIs). Freed memory simply stays resident for the next phase.
+    unsafe extern "C" {
+        fn mallopt(param: i32, value: i32) -> i32;
+    }
+    const M_TRIM_THRESHOLD: i32 = -1;
+    unsafe { mallopt(M_TRIM_THRESHOLD, i32::MAX) };
+    let lap = |what: &str| {
+        let (u, s, f) = rusage();
+        eprintln!("{:>8.3}s (user {u:.3} sys {s:.3} faults {f}) {what}", t0.elapsed().as_secs_f64());
+    };
     let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok());
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or("/output".into()));
@@ -225,7 +237,7 @@ fn main() {
     lap("people");
 
     // campaign_daily: the threads' cells summed; a row wherever a campaign credited or assisted a session.
-    let mut cells = vec![Cell::default(); (ncamp + 1) * ndays];
+    let mut cells: Vec<Cell> = mem::zeroed((ncamp + 1) * ndays);
     for (c, _) in &results {
         for (a, b) in cells.iter_mut().zip(c) {
             a.sessions += b.sessions;
@@ -267,13 +279,36 @@ fn main() {
     let rows: usize = results.iter().map(|r| r.1).sum();
     let (cs, cr) = (c0.iter().sum::<i64>(), c2.iter().sum::<i64>());
     lap(&format!("write: {rows} user rows, {} campaign rows; sessions {cs}, revenue {cr}", days.len()));
-    // Nothing is dropped; the big mappings are released on all threads so exit does not tear them down on one.
+    // Nothing is dropped; the big mappings are released on all threads so exit does not tear them down on one,
+    // and _exit skips the libc teardown.
     parallel(threads, |t| {
         evs[t].release();
         cks[t].release();
         ev2[t].release();
+        if t == 0 {
+            links.release();
+        }
     });
-    std::process::exit(0);
+    unsafe extern "C" {
+        fn _exit(code: i32) -> !;
+    }
+    unsafe { _exit(0) }
+}
+
+/// The process's user seconds, system seconds and minor faults so far.
+fn rusage() -> (f64, f64, i64) {
+    #[repr(C)]
+    struct Rusage {
+        utime: [i64; 2],
+        stime: [i64; 2],
+        rest: [i64; 14], // maxrss, ixrss, idrss, isrss, minflt, ...
+    }
+    unsafe extern "C" {
+        fn getrusage(who: i32, r: *mut Rusage) -> i32;
+    }
+    let mut r = Rusage { utime: [0; 2], stime: [0; 2], rest: [0; 14] };
+    unsafe { getrusage(0, &mut r) };
+    (r.utime[0] as f64 + r.utime[1] as f64 * 1e-6, r.stime[0] as f64 + r.stime[1] as f64 * 1e-6, r.rest[4])
 }
 
 /// The number in an ID of the shape `prefix` + 1..=7 ASCII digits without a leading zero.
