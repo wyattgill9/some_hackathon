@@ -82,20 +82,45 @@ fn two(a: u8, b: u8) -> Option<i64> {
     (x < 10 && y < 10).then_some((x * 10 + y) as i64)
 }
 
-/// `HH:MM:SS` to ms, or None. Digit lanes must be 0..=9 after xor with '0', separator lanes must be 0.
+/// `HH:MM:SS` to ms, or None. After xor with "00:00:00" the six digit lanes hold 0..=9 in their low nibbles
+/// and every other nibble is zero; PEXT gathers the six low nibbles into three byte indexes into tables that
+/// hold the value in ms, or a huge number for an impossible pair, so one compare checks the whole time.
 #[inline(always)]
 fn time_of_day(t: &[u8]) -> Option<i64> {
     let x = u64::from_le_bytes(t.try_into().unwrap()) ^ 0x3030_3a30_303a_3030;
-    if (x.wrapping_add(0x7676_7f76_767f_7676) | x) & 0x8080_8080_8080_8080 != 0 {
+    if x & 0xf0f0_fff0_f0ff_f0f0 != 0 {
         return None;
     }
-    let d = |i: u32| (x >> (8 * i)) & 0xff;
-    let (h, m, s) = (d(0) * 10 + d(1), d(3) * 10 + d(4), d(6) * 10 + d(7));
-    if h > 23 || m > 59 || s > 59 {
-        return None;
-    }
-    Some(((h * 60 + m) * 60 + s) as i64 * 1000)
+    #[cfg(target_feature = "bmi2")]
+    let packed = unsafe { std::arch::x86_64::_pext_u64(x, 0x0f0f_000f_0f00_0f0f) };
+    #[cfg(not(target_feature = "bmi2"))]
+    let packed = (x & 0xf) | (x >> 4 & 0xf0) | (x >> 16 & 0xf00) | (x >> 20 & 0xf000) | (x >> 32 & 0xf_0000) | (x >> 36 & 0xf0_0000);
+    let ms = TOD.0[(packed & 0xff) as usize] + TOD.1[(packed >> 8 & 0xff) as usize] + TOD.2[(packed >> 16 & 0xff) as usize];
+    (ms < 86_400_000).then_some(ms as i64)
 }
+
+/// Per two-nibble index (tens in the low nibble, ones in the high nibble): ms for a valid hour / minute /
+/// second, or 1 << 40 for an impossible one.
+const fn tod_tables() -> ([u64; 256], [u64; 256], [u64; 256]) {
+    let (mut h, mut m, mut s) = ([1u64 << 40; 256], [1u64 << 40; 256], [1u64 << 40; 256]);
+    let mut i = 0;
+    while i < 256 {
+        let (tens, ones) = (i & 15, i >> 4);
+        if tens <= 9 && ones <= 9 {
+            let v = (tens * 10 + ones) as u64;
+            if v <= 23 {
+                h[i] = v * 3_600_000;
+            }
+            if v <= 59 {
+                m[i] = v * 60_000;
+                s[i] = v * 1000;
+            }
+        }
+        i += 1;
+    }
+    (h, m, s)
+}
+static TOD: ([u64; 256], [u64; 256], [u64; 256]) = tod_tables();
 
 /// Right-aligns `len` bytes into 16 lanes with `pshufb` and fills the lanes before them with '0'.
 const fn align_tables() -> ([[u8; 16]; 17], [[u8; 16]; 17]) {

@@ -24,6 +24,31 @@ const fn code_table() -> [u8; 256] {
     t
 }
 const CODE: [u8; 256] = code_table();
+
+/// pshufb tables for `pack16`: class bits per high nibble, class bits per low nibble, code offset per high nibble.
+/// Class 1: high 0x3 with low 0..=9. Class 2: high 0x4/0x6 with low 1..=15. Class 4: high 0x5/0x7 with low
+/// 0..=10. Class 8: high 0x5 with low 15 ('_').
+const NIBBLE: ([u8; 16], [u8; 16], [u8; 16]) = {
+    let mut hi = [0u8; 16];
+    hi[3] = 1;
+    hi[4] = 2;
+    hi[5] = 4 | 8;
+    hi[6] = 2;
+    hi[7] = 4;
+    let mut lo = [0u8; 16];
+    let mut i = 0;
+    while i < 16 {
+        lo[i] = (if i <= 9 { 1 } else { 0 }) | (if i >= 1 { 2 } else { 0 }) | (if i <= 10 { 4 } else { 0 }) | (if i == 15 { 8 } else { 0 });
+        i += 1;
+    }
+    let mut off = [0u8; 16];
+    off[3] = b'0' - 1;
+    off[4] = b'A' - 11;
+    off[5] = b'A' - 11;
+    off[6] = b'a' - 38;
+    off[7] = b'a' - 38;
+    (hi, lo, off)
+};
 const DECODE: &[u8; 64] = b"\x000123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
 
 #[inline]
@@ -59,22 +84,21 @@ pub unsafe fn pack16(p: *const u8, len: usize) -> Key {
             return pack(std::slice::from_raw_parts(p, len));
         }
         let v = _mm_loadu_si128(p as *const __m128i);
-        let ge = |lo: u8| _mm_cmpgt_epi8(v, _mm_set1_epi8(lo as i8 - 1));
-        let le = |hi: u8| _mm_cmpgt_epi8(_mm_set1_epi8(hi as i8 + 1), v);
-        let digit = _mm_and_si128(ge(b'0'), le(b'9'));
-        let upper = _mm_and_si128(ge(b'A'), le(b'Z'));
-        let under = _mm_cmpeq_epi8(v, _mm_set1_epi8(b'_' as i8));
-        let lower = _mm_and_si128(ge(b'a'), le(b'z'));
-        let any = _mm_or_si128(_mm_or_si128(digit, upper), _mm_or_si128(under, lower));
+        // Each byte's class from its two nibbles: a byte is in the alphabet iff some class accepts both its
+        // high nibble (0x3 digits; 0x4/0x6 letters 1..15; 0x5/0x7 letters 0..10; 0x5 '_' at 15) and its low.
+        let lo = _mm_and_si128(v, _mm_set1_epi8(0x0f));
+        let hi = _mm_and_si128(_mm_srli_epi16::<4>(v), _mm_set1_epi8(0x0f));
+        let hi_class = _mm_shuffle_epi8(_mm_loadu_si128(NIBBLE.0.as_ptr() as *const __m128i), hi);
+        let lo_class = _mm_shuffle_epi8(_mm_loadu_si128(NIBBLE.1.as_ptr() as *const __m128i), lo);
+        let bad = _mm_cmpeq_epi8(_mm_and_si128(hi_class, lo_class), _mm_setzero_si128());
         let lanes = (1u32 << len) - 1;
-        if _mm_movemask_epi8(any) as u32 & lanes != lanes {
+        if _mm_movemask_epi8(bad) as u32 & lanes != 0 || (_mm_movemask_epi8(v) as u32 & lanes) != 0 {
             return pack(std::slice::from_raw_parts(p, len));
         }
-        let code = |m: __m128i, off: u8| _mm_and_si128(m, _mm_sub_epi8(v, _mm_set1_epi8(off as i8)));
-        let codes = _mm_or_si128(
-            _mm_or_si128(code(digit, b'0' - 1), code(upper, b'A' - 11)),
-            _mm_or_si128(_mm_and_si128(under, _mm_set1_epi8(37)), code(lower, b'a' - 38)),
-        );
+        // code = byte - offset(high nibble); '_' (0x5f) is the one exception to its row's offset.
+        let off = _mm_shuffle_epi8(_mm_loadu_si128(NIBBLE.2.as_ptr() as *const __m128i), hi);
+        let under = _mm_cmpeq_epi8(v, _mm_set1_epi8(b'_' as i8));
+        let codes = _mm_blendv_epi8(_mm_sub_epi8(v, off), _mm_set1_epi8(37), under);
         // Lanes past the ID are zeroed; the first 8 codes pack with one pext, codes 9 and 10 by hand.
         let keep = _mm_cmpgt_epi8(_mm_set1_epi8(len as i8), _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15));
         let codes = _mm_and_si128(codes, keep);
