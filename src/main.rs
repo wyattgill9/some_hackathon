@@ -114,9 +114,18 @@ fn main() {
     let campaigns_buf = fs::read(data.join("campaigns.csv")).unwrap();
     let campaigns: Vec<[&[u8]; 2]> = lines(&campaigns_buf).filter_map(parse::fields::<2>).collect();
     let mut camp_of = U64Map::new(campaigns.len());
+    // Campaign IDs of the files' own shape, `c_` + a number without a leading zero, index an array; every
+    // other spelling (` c_1`, `C_1`, `c_01`) is a different ID and goes through the exact map.
+    let mut camp_num: Vec<u32> = Vec::new();
     for (i, [c, _]) in campaigns.iter().enumerate() {
         if !c.is_empty() {
             camp_of.insert(key::pack(c), i as u32);
+        }
+        if let Some(n) = numbered(c, b"c_") {
+            if camp_num.len() <= n {
+                camp_num.resize(n + 1, 0);
+            }
+            camp_num[n] = i as u32 + 1;
         }
     }
     let ncamp = campaigns.len();
@@ -192,7 +201,7 @@ fn main() {
                 });
             } else {
                 rd.fields::<4>(&click_files[r.file].0, r, |l| {
-                    if let Some(c) = parse_click(l, &ctx, &camp_of, &mut tc) {
+                    if let Some(c) = parse_click(l, &ctx, &camp_of, &camp_num, &mut tc) {
                         links.prefetch(c.person);
                         if let Some(old) = cpipe.push(c) {
                             emit_ck(old, &mut cks);
@@ -299,6 +308,23 @@ fn main() {
     std::process::exit(0);
 }
 
+/// The number in an ID of the shape `prefix` + 1..=7 ASCII digits without a leading zero.
+#[inline(always)]
+fn numbered(id: &[u8], prefix: &[u8]) -> Option<usize> {
+    let digits = id.strip_prefix(prefix)?;
+    if digits.is_empty() || digits.len() > 7 || (digits[0] == b'0' && digits.len() > 1) {
+        return None;
+    }
+    let mut n = 0usize;
+    for &d in digits {
+        if !d.is_ascii_digit() {
+            return None;
+        }
+        n = n * 10 + (d - b'0') as usize;
+    }
+    Some(n)
+}
+
 /// `n` threads running `f(thread index)`; their results in order.
 pub fn parallel<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
     std::thread::scope(|s| {
@@ -394,13 +420,16 @@ fn parse_event(l: &Line, ctx: &Ctx, cat_of: &U64Map, tc: &mut TsCache, e: &mut E
 
 /// The click's `person` is still its user ID: the caller resolves it through the link table.
 #[inline]
-fn parse_click(l: &Line, ctx: &Ctx, camp_of: &U64Map, tc: &mut TsCache) -> Option<Ck> {
+fn parse_click(l: &Line, ctx: &Ctx, camp_of: &U64Map, camp_num: &[u32], tc: &mut TsCache) -> Option<Ck> {
     let (id, user, camp, ts) = (l.get(0), l.get(1), l.get(2), l.get(3));
     if id.is_empty() || user.is_empty() {
         return None;
     }
     let t = unsafe { tc.parse_raw(ts.as_ptr(), ts.len()) }.filter(|&t| t >= ctx.cws && t < ctx.we)?;
-    let camp = camp_of.get(unsafe { key::pack16(camp.as_ptr(), camp.len()) })?;
+    let camp = match numbered(camp, b"c_").and_then(|n| camp_num.get(n)).copied() {
+        Some(i) if i != 0 => i - 1,
+        _ => camp_of.get(unsafe { key::pack16(camp.as_ptr(), camp.len()) })?,
+    };
     Some(Ck {
         person: unsafe { key::pack16(user.as_ptr(), user.len()) },
         cid: unsafe { key::pack16(id.as_ptr(), id.len()) },

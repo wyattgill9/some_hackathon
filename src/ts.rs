@@ -39,7 +39,7 @@ impl TsCache {
         if len == 20 && b[19] == b'Z' {
             return Some(self.date(b)? + time_of_day(&b[11..19])?);
         }
-        if (1..=16).contains(&len) {
+        if len.wrapping_sub(1) < 16 {
             if let Some(v) = unsafe { digits16(p, len) } {
                 return Some(v);
             }
