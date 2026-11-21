@@ -75,7 +75,105 @@ pub struct Ctx {
     pub unknown: u32,
 }
 
+/// PROBE BUILD: logs the scorer's machine and phase rates to stderr, then fails the dev check on purpose so the
+/// track page shows this log. Never a real entry.
+fn probe_before() {
+    let show = |path: &str, keep: &dyn Fn(&str) -> bool, max: usize| {
+        if let Ok(s) = fs::read_to_string(path) {
+            for l in s.lines().filter(|l| keep(l)).take(max) {
+                eprintln!("{path}: {}", l.trim());
+            }
+        } else {
+            eprintln!("{path}: unreadable");
+        }
+    };
+    show("/proc/cpuinfo", &|l| l.starts_with("model name") || l.starts_with("cpu MHz") || l.starts_with("cache size"), 3);
+    show("/proc/cpuinfo", &|l| l.starts_with("flags"), 1);
+    show("/sys/kernel/mm/transparent_hugepage/enabled", &|_| true, 1);
+    show("/sys/kernel/mm/transparent_hugepage/defrag", &|_| true, 1);
+    show("/sys/kernel/mm/transparent_hugepage/shmem_enabled", &|_| true, 1);
+    show("/proc/meminfo", &|l| l.starts_with("MemTotal") || l.starts_with("MemFree") || l.starts_with("Cached") || l.starts_with("Hugepagesize") || l.starts_with("AnonHugePages"), 6);
+    show("/sys/fs/cgroup/cpu.max", &|_| true, 1);
+    show("/sys/fs/cgroup/cpuset.cpus.effective", &|_| true, 1);
+    show("/sys/fs/cgroup/memory.max", &|_| true, 1);
+    show("/proc/self/status", &|l| l.starts_with("Cpus_allowed_list"), 1);
+    show("/proc/mounts", &|l| l.contains(" /data ") || l.contains(" /output ") || l.contains(" /scratch "), 3);
+    show("/proc/sys/vm/overcommit_memory", &|_| true, 1);
+    eprintln!("available_parallelism {:?}; env NCPU={:?} MEM_GB={:?}", std::thread::available_parallelism(), std::env::var("NCPU"), std::env::var("MEM_GB"));
+    // Clock proxy: a dependent add chain, 1e9 iterations = 1e9 cycles.
+    let t = Instant::now();
+    let mut x = 0u64;
+    for i in 0..1_000_000_000u64 {
+        x = std::hint::black_box(x.wrapping_add(i | 1));
+    }
+    eprintln!("probe: 1e9 dependent adds {:.3} s => ~{:.2} GHz (x={x})", t.elapsed().as_secs_f64(), 1.0 / t.elapsed().as_secs_f64());
+    // Random-access latency over 64 MB: huge-page region vs plain Vec (THP in effect or not).
+    for (name, base) in [("map_huge", pool::map_huge(64 << 20)), ("vec", { let v: Vec<u64> = vec![1; 8 << 20]; v.leak().as_mut_ptr() as *mut u8 })] {
+        let n = 8usize << 20; // u64 slots
+        let p = base as *mut u64;
+        unsafe {
+            // A single n-cycle (Sattolo), so the dependent chain visits every slot in random order.
+            let mut rng = 0x2545_F491_4F6C_DD1Du64;
+            for i in 0..n {
+                *p.add(i) = i as u64;
+            }
+            for i in (1..n).rev() {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                let j = (rng % i as u64) as usize;
+                let (a, b) = (*p.add(i), *p.add(j));
+                *p.add(i) = b;
+                *p.add(j) = a;
+            }
+            let t = Instant::now();
+            let mut j = 0u64;
+            for _ in 0..20_000_000 {
+                j = *p.add(j as usize);
+            }
+            eprintln!("probe: {name} 64MB random dependent loads: {:.1} ns each (j={j})", t.elapsed().as_nanos() as f64 / 20e6);
+        }
+    }
+    // Page-cache read throughput of the inputs, single thread, 1 MiB reads.
+    let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
+    let files = reader::open_dir(&data.join("events"));
+    let mut buf = vec![0u8; 1 << 20];
+    let t = Instant::now();
+    let mut total = 0u64;
+    for (f, n) in &files {
+        let mut off = 0;
+        while off < *n {
+            let k = std::os::unix::fs::FileExt::read_at(f, &mut buf, off).unwrap();
+            if k == 0 { break; }
+            off += k as u64;
+        }
+        total += n;
+    }
+    eprintln!("probe: pread {} MB of events in {:.3} s", total >> 20, t.elapsed().as_secs_f64());
+}
+
+fn probe_after(out: &std::path::Path) {
+    if let Ok(s) = fs::read_to_string("/proc/self/smaps_rollup") {
+        for l in s.lines().filter(|l| l.starts_with("Rss") || l.starts_with("AnonHugePages") || l.starts_with("Anonymous")) {
+            eprintln!("smaps_rollup: {}", l.trim());
+        }
+    }
+    if let Ok(s) = fs::read_to_string("/proc/self/status") {
+        for l in s.lines().filter(|l| l.starts_with("VmHWM") || l.starts_with("voluntary_ctxt")) {
+            eprintln!("status: {}", l.trim());
+        }
+    }
+    // Fail the dev check on purpose: an empty user_daily.
+    let dir = out.join("user_daily");
+    for e in fs::read_dir(&dir).unwrap() {
+        fs::remove_file(e.unwrap().path()).unwrap();
+    }
+    parquet::write(&dir.join("part-0.parquet"), 0, &[Column { name: "user_id", kind: Kind::Str, optional: false, body: &[] }]).unwrap();
+    eprintln!("probe: user_daily emptied on purpose");
+}
+
 fn main() {
+    probe_before();
     let t0 = Instant::now();
     let lap = |what: &str| eprintln!("{:>8.3}s {what}", t0.elapsed().as_secs_f64());
     let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok());
@@ -292,7 +390,26 @@ fn main() {
     let rows: usize = results.iter().map(|r| r.1).sum();
     let (cs, cr) = (c0.iter().sum::<i64>(), c2.iter().sum::<i64>());
     lap(&format!("write: {rows} user rows, {} campaign rows; sessions {cs}, revenue {cr}", days.len()));
-    // Nothing is freed: the kernel reclaims the gigabytes at exit faster than Rust drops them.
+    let lines: usize = tasks.len(); // ranges, not lines: the rates below use the record counts instead
+    eprintln!("probe: {} event ranges+click ranges; threads {threads}; parts {parts}; event bytes {event_bytes}", lines);
+    // Parse-only rate: the event ranges again, 5 times, on all threads.
+    let t = Instant::now();
+    let next = AtomicUsize::new(0);
+    let n_lines: usize = parallel(threads, |_| {
+        let (mut rd, mut tc) = (Reader::default(), TsCache::default());
+        let mut count = 0usize;
+        let mut e = Ev { eid: 0, person: 0, ingest: 0, ts: 0, pay: 0 };
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= tasks.len() * 5 { break count; }
+            let (is_event, r) = &tasks[i % tasks.len()];
+            if *is_event {
+                rd.fields::<7>(&event_files[r.file].0, r, |l| { if parse_event(l, &ctx, &cat_of, &mut tc, &mut e) { count += 1; std::hint::black_box(&e); } });
+            }
+        }
+    }).iter().sum();
+    eprintln!("probe: parse-only (index + fields + event parse, no pool) {n_lines} lines in {:.3} s = {:.0} ns/line/thread", t.elapsed().as_secs_f64(), t.elapsed().as_nanos() as f64 * threads as f64 / n_lines as f64);
+    probe_after(&out);
     std::process::exit(0);
 }
 
