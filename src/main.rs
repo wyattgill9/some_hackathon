@@ -29,18 +29,20 @@ pub const DAY: i64 = 86_400_000;
 pub const WEEK: i64 = 7 * DAY;
 pub const GAP: i64 = 1_800_000;
 
-/// A parsed event copy. Times are relative to `cws` (window_start - 7 d): `ts` in ms, `ingest` in seconds
-/// biased by 2^31. `pay` = price | category << 24 for a purchase, else 0. `flags` bit 0: valid and not late.
+/// A parsed event copy, 28 bytes. Times are relative to `cws` (window_start - 7 d): `ts` in ms, `ingest` in
+/// seconds biased by 2^31. `pay` = price | category << 24 for a purchase, else 0, with bit 31 = valid and not
+/// late (categories therefore use 7 bits).
 #[derive(Clone, Copy)]
-#[repr(C)]
+#[repr(C, packed)]
 pub struct Ev {
     eid: Key,
     person: Key,
     ingest: u32,
     ts: u32,
     pay: u32,
-    flags: u32,
 }
+
+const VALID: u32 = 1 << 31;
 
 /// A surviving event.
 #[derive(Clone, Copy)]
@@ -96,8 +98,8 @@ fn main() {
     let mut cats: Vec<&[u8]> = products.iter().map(|[_, c]| *c).chain([&b"unknown"[..]]).collect();
     cats.sort_unstable();
     cats.dedup();
-    if cats.len() > 256 {
-        eprintln!("{} categories: more than the 8-bit category index holds", cats.len());
+    if cats.len() > 128 {
+        eprintln!("{} categories: more than the 7-bit category index holds", cats.len());
         std::process::exit(3);
     }
     let unknown = cats.binary_search(&&b"unknown"[..]).unwrap() as u32;
@@ -165,7 +167,8 @@ fn main() {
         let (mut epipe, mut cpipe) = (Pipe::<Ev>::default(), Pipe::<Ck>::default());
         let emit_ev = |mut e: Ev, evs: &mut Pool<Ev>| {
             e.person = links.lookup(e.person);
-            evs.push((mix(e.eid) >> (64 - bits)) as usize, e);
+            let eid = e.eid;
+            evs.push((mix(eid) >> (64 - bits)) as usize, e);
         };
         let emit_ck = |mut c: Ck, cks: &mut Pool<Ck>| {
             c.person = links.lookup(c.person);
@@ -176,9 +179,11 @@ fn main() {
             let Some((is_event, r)) = tasks.get(i) else { break };
             if *is_event {
                 rd.fields::<7>(&event_files[r.file].0, r, |l| {
-                    if let Some(e) = parse_event(l, &ctx, &cat_of, &mut tc) {
-                        links.prefetch(e.person);
-                        if let Some(old) = epipe.push(e) {
+                    let (slot, old) = epipe.slot();
+                    if parse_event(l, &ctx, &cat_of, &mut tc, slot) {
+                        let user = slot.person;
+                        links.prefetch(user);
+                        if let Some(old) = epipe.advance(old) {
                             emit_ev(old, &mut evs);
                         }
                     }
@@ -317,9 +322,21 @@ impl<T: Copy> Default for Pipe<T> {
 }
 
 impl<T: Copy> Pipe<T> {
-    #[inline]
+    #[inline(always)]
     fn push(&mut self, v: T) -> Option<T> {
-        let old = std::mem::replace(&mut self.ring[self.at], v);
+        let (slot, old) = self.slot();
+        *slot = v;
+        self.advance(old)
+    }
+    /// The slot the next record is built in, and what it held.
+    #[inline(always)]
+    fn slot(&mut self) -> (&mut T, T) {
+        let old = self.ring[self.at];
+        (&mut self.ring[self.at], old)
+    }
+    /// After the slot was filled: the record pushed PIPE calls earlier, once the ring is full.
+    #[inline(always)]
+    fn advance(&mut self, old: T) -> Option<T> {
         self.at = (self.at + 1) % PIPE;
         if self.filled < PIPE {
             self.filled += 1;
@@ -335,11 +352,12 @@ impl<T: Copy> Pipe<T> {
     }
 }
 
-/// The event's `person` is still its user ID: the caller resolves it through the link table.
-#[inline]
-fn parse_event([id, user, ts, ingest, kind, product, price]: [&[u8]; 7], ctx: &Ctx, cat_of: &U64Map, tc: &mut TsCache) -> Option<Ev> {
+/// Fills `e` from a line; false if the line yields no copy. Its `person` is still the user ID: the caller
+/// resolves it through the link table.
+#[inline(always)]
+fn parse_event([id, user, ts, ingest, kind, product, price]: [&[u8]; 7], ctx: &Ctx, cat_of: &U64Map, tc: &mut TsCache, e: &mut Ev) -> bool {
     if id.is_empty() {
-        return None;
+        return false;
     }
     let t = tc.parse(ts).filter(|t| (ctx.ws..ctx.we).contains(t));
     // ponytail: rules.md guarantees ingest_ts is valid F1; a bad one sorts last and fails the late check.
@@ -356,14 +374,12 @@ fn parse_event([id, user, ts, ingest, kind, product, price]: [&[u8]; 7], ctx: &C
         }
     }
     // Fields point into the reader's buffer, which keeps 64 readable bytes past the data.
-    Some(Ev {
-        eid: unsafe { key::pack16(id.as_ptr(), id.len()) },
-        person: if valid { unsafe { key::pack16(user.as_ptr(), user.len()) } } else { 0 },
-        ingest: (ing.div_euclid(1000) - ctx.cws.div_euclid(1000) + (1 << 31)).clamp(0, u32::MAX as i64) as u32,
-        ts: t.map_or(0, |t| (t - ctx.cws) as u32),
-        pay,
-        flags: valid as u32,
-    })
+    e.eid = unsafe { key::pack16(id.as_ptr(), id.len()) };
+    e.person = if valid { unsafe { key::pack16(user.as_ptr(), user.len()) } } else { 0 };
+    e.ingest = (ing.div_euclid(1000) - ctx.cws.div_euclid(1000) + (1 << 31)).clamp(0, u32::MAX as i64) as u32;
+    e.ts = t.map_or(0, |t| (t - ctx.cws) as u32);
+    e.pay = pay | if valid { VALID } else { 0 };
+    true
 }
 
 /// The click's `person` is still its user ID: the caller resolves it through the link table.
@@ -393,7 +409,8 @@ fn dedup(recs: &[Ev], tab: &mut Vec<u32>, bits: u32, out: &mut Pool<Ev2>) {
     tab.clear();
     tab.resize(cap, 0);
     for (i, r) in recs.iter().enumerate() {
-        let mut h = ((mix(r.eid) << bits) >> shift) as usize;
+        let (eid, ingest) = (r.eid, r.ingest);
+        let mut h = ((mix(eid) << bits) >> shift) as usize;
         loop {
             let s = tab[h];
             if s == 0 {
@@ -401,8 +418,8 @@ fn dedup(recs: &[Ev], tab: &mut Vec<u32>, bits: u32, out: &mut Pool<Ev2>) {
                 break;
             }
             let j = (s - 1) as usize;
-            if recs[j].eid == r.eid {
-                if r.ingest < recs[j].ingest {
+            if recs[j].eid == eid {
+                if ingest < recs[j].ingest {
                     tab[h] = i as u32 + 1;
                 }
                 break;
@@ -412,9 +429,9 @@ fn dedup(recs: &[Ev], tab: &mut Vec<u32>, bits: u32, out: &mut Pool<Ev2>) {
     }
     for &s in tab.iter() {
         if s != 0 {
-            let r = &recs[(s - 1) as usize];
-            if r.flags & 1 == 1 {
-                out.push((mix(r.person) >> (64 - bits)) as usize, Ev2 { person: r.person, ts: r.ts, pay: r.pay });
+            let r = recs[(s - 1) as usize];
+            if r.pay & VALID != 0 {
+                out.push((mix(r.person) >> (64 - bits)) as usize, Ev2 { person: r.person, ts: r.ts, pay: r.pay & !VALID });
             }
         }
     }

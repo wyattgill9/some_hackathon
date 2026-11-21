@@ -26,7 +26,7 @@ unsafe impl<T: Copy> Sync for Pool<T> {}
 
 impl<T: Copy> Pool<T> {
     pub fn new(parts: usize) -> Self {
-        assert!(size_of::<T>() % 8 == 0 && (STAGE * size_of::<T>()) % 32 == 0);
+        assert!(size_of::<T>() % 4 == 0 && (STAGE * size_of::<T>()) % 32 == 0);
         Pool {
             cap: (BLOCK / size_of::<T>()) & !(STAGE - 1),
             stage: vec![unsafe { std::mem::zeroed() }; parts],
@@ -39,7 +39,7 @@ impl<T: Copy> Pool<T> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn push(&mut self, p: usize, v: T) {
         let f = self.fill[p] as usize;
         self.stage[p][f] = v;
@@ -50,7 +50,7 @@ impl<T: Copy> Pool<T> {
         }
     }
 
-    #[inline]
+    #[inline(never)]
     fn flush(&mut self, p: usize) {
         if self.cur[p].is_null() || self.used[p] as usize + STAGE > self.cap {
             self.new_block(p);

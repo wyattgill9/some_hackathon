@@ -18,25 +18,35 @@ impl Default for TsCache {
 }
 
 impl TsCache {
-    #[inline]
+    #[inline(always)]
     pub fn parse(&mut self, b: &[u8]) -> Option<i64> {
         if b.len() == 20 && b[19] == b'Z' {
-            let key = u64::from_le_bytes(b[0..8].try_into().unwrap());
-            let tail = u32::from_le_bytes([b[8], b[9], b[10], 0]);
-            let slot = ((b[8] & 15) as usize * 10 + (b[9] & 15) as usize) & (SLOTS - 1);
-            let day = if self.keys[slot] == key && self.tails[slot] == tail {
-                self.days[slot]
-            } else {
-                self.learn(slot, key, tail, b)?
-            };
-            return Some(day + time_of_day(&b[11..19])?);
+            return Some(self.date(b)? + time_of_day(&b[11..19])?);
         }
         if b.len() <= 16 {
             if let Some(v) = digits(b) {
                 return Some(v);
             }
         }
+        if b.len() == 25 && matches!(b[19], b'+' | b'-') && b[22] == b':' {
+            let local = self.date(b)? + time_of_day(&b[11..19])?;
+            let (h, m) = (two(b[20], b[21])?, two(b[23], b[24])?);
+            if h > 23 || m > 59 {
+                return None;
+            }
+            let off = (h * 60 + m) * 60_000;
+            return Some(if b[19] == b'+' { local - off } else { local + off });
+        }
         parse::ts(b)
+    }
+
+    /// The midnight of a valid `YYYY-MM-DDT` prefix, from the cache or the calendar.
+    #[inline(always)]
+    fn date(&mut self, b: &[u8]) -> Option<i64> {
+        let key = u64::from_le_bytes(b[0..8].try_into().unwrap());
+        let tail = u32::from_le_bytes([b[8], b[9], b[10], 0]);
+        let slot = ((b[8] & 15) as usize * 10 + (b[9] & 15) as usize) & (SLOTS - 1);
+        if self.keys[slot] == key && self.tails[slot] == tail { Some(self.days[slot]) } else { self.learn(slot, key, tail, b) }
     }
 
     #[cold]
@@ -50,8 +60,14 @@ impl TsCache {
     }
 }
 
+#[inline(always)]
+fn two(a: u8, b: u8) -> Option<i64> {
+    let (x, y) = (a.wrapping_sub(b'0'), b.wrapping_sub(b'0'));
+    (x < 10 && y < 10).then_some((x * 10 + y) as i64)
+}
+
 /// `HH:MM:SS` to ms, or None. Digit lanes must be 0..=9 after xor with '0', separator lanes must be 0.
-#[inline]
+#[inline(always)]
 fn time_of_day(t: &[u8]) -> Option<i64> {
     let x = u64::from_le_bytes(t.try_into().unwrap()) ^ 0x3030_3a30_303a_3030;
     if (x.wrapping_add(0x7676_7f76_767f_7676) | x) & 0x8080_8080_8080_8080 != 0 {
@@ -129,6 +145,14 @@ mod tests {
             let f1 = format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem / 60 % 60, rem % 60);
             check(f1.as_bytes());
             check(format!("{t}").as_bytes());
+            let (oh, om) = (next() % 26, next() % 62); // offsets up to +25:61: some valid, some not
+            let sign = if next() % 2 == 0 { '+' } else { '-' };
+            let f2 = format!("{}{sign}{oh:02}:{om:02}", &f1[..19]);
+            check(f2.as_bytes());
+            let mut bytes = f2.into_bytes();
+            let i = (next() % 25) as usize;
+            bytes[i] = (next() % 128) as u8;
+            check(&bytes);
             check(format!("{:013}", t % 10_000_000_000).as_bytes());
             let mut bytes = f1.into_bytes();
             let i = (next() % 20) as usize;
