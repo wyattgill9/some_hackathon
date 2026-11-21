@@ -213,8 +213,7 @@ fn main() {
         for c in cpipe.drain() {
             emit_ck(c, &links, bits, &mut cks);
         }
-        evs.0.finish();
-        evs.1.finish();
+        evs.0.finish2(&mut evs.1);
         cks.finish();
         (evs.0, evs.1, cks)
     });
@@ -430,9 +429,8 @@ fn parse_event(l: &Line, ctx: &Ctx, cat_of: &U64Map, tc: &mut TsCache, e: &mut E
 #[inline(always)]
 fn emit_ev(e: Ev, links: &links::Links, bits: u32, (keys, pays): &mut (Pool<EvKey, EV_STAGE>, Pool<Ev2, EV_STAGE>)) {
     let p = (mix(e.key.eid) >> (64 - bits)) as usize;
-    keys.push(p, e.key);
-    // Built in registers: a wide load of a record patched in memory would wait for the patch to retire.
-    pays.push(p, Ev2 { person: links.lookup(e.pay.person), ts: e.pay.ts, pay: e.pay.pay });
+    // The payload is built in registers: a wide load of a record patched in memory would wait for the patch.
+    keys.push2(pays, p, e.key, Ev2 { person: links.lookup(e.pay.person), ts: e.pay.ts, pay: e.pay.pay });
 }
 
 /// A click, its user ID resolved to its person, into its person partition.

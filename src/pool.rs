@@ -60,9 +60,32 @@ impl<T: Copy, const S: usize> Pool<T, S> {
                 self.flush(p, &v);
             } else {
                 *self.fill.get_unchecked_mut(p) = f as u8 + 1;
-                *(self.stage.get_unchecked_mut(p).0.as_mut_ptr().add(f * size_of::<T>()) as *mut T) = v;
+                self.stage_in(p, f, v);
             }
         }
+    }
+
+    /// `push` of `v` here and of `u` into `other`, whose stages hold as many records: one fill count serves
+    /// both (the other pool's own counts stay zero; finish the pair with `finish2`).
+    #[inline(always)]
+    pub fn push2<U: Copy, const S2: usize>(&mut self, other: &mut Pool<U, S2>, p: usize, v: T, u: U) {
+        const { assert!(S / size_of::<T>() == S2 / size_of::<U>(), "the pools must stage the same number of records") };
+        unsafe {
+            let f = *self.fill.get_unchecked(p) as usize;
+            if f + 1 == Self::PER {
+                self.flush(p, &v);
+                other.flush(p, &u);
+            } else {
+                *self.fill.get_unchecked_mut(p) = f as u8 + 1;
+                self.stage_in(p, f, v);
+                other.stage_in(p, f, u);
+            }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn stage_in(&mut self, p: usize, f: usize, v: T) {
+        unsafe { *(self.stage.get_unchecked_mut(p).0.as_mut_ptr().add(f * size_of::<T>()) as *mut T) = v };
     }
 
     /// Streams the staging line, completed by `last`, into the block. The last record never goes through the
@@ -113,21 +136,32 @@ impl<T: Copy, const S: usize> Pool<T, S> {
     pub fn finish(&mut self) {
         for p in 0..self.fill.len() {
             let f = self.fill[p] as usize;
-            if f == 0 {
-                continue;
-            }
-            if self.at[p][1].is_null() || unsafe { self.at[p][1].offset_from(self.at[p][0]) } < f as isize {
-                self.new_block(p);
-            }
-            let w = self.at[p][0];
-            unsafe { std::ptr::copy_nonoverlapping(self.stage[p].0.as_ptr() as *const T, w, f) };
-            self.at[p][0] = unsafe { w.add(f) };
-            self.fill[p] = 0;
+            self.finish_part(p, f);
         }
-        #[cfg(target_feature = "avx2")]
-        unsafe {
-            std::arch::x86_64::_mm_sfence()
-        };
+        fence();
+    }
+
+    /// `finish` of this pool and of the one it was paired with in `push2`.
+    pub fn finish2<U: Copy, const S2: usize>(&mut self, other: &mut Pool<U, S2>) {
+        for p in 0..self.fill.len() {
+            let f = self.fill[p] as usize;
+            self.finish_part(p, f);
+            other.finish_part(p, f);
+        }
+        fence();
+    }
+
+    fn finish_part(&mut self, p: usize, f: usize) {
+        if f == 0 {
+            return;
+        }
+        if self.at[p][1].is_null() || unsafe { self.at[p][1].offset_from(self.at[p][0]) } < f as isize {
+            self.new_block(p);
+        }
+        let w = self.at[p][0];
+        unsafe { std::ptr::copy_nonoverlapping(self.stage[p].0.as_ptr() as *const T, w, f) };
+        self.at[p][0] = unsafe { w.add(f) };
+        self.fill[p] = 0;
     }
 
     /// Gives the pool's own arenas back now, in the calling thread, instead of at exit on one core.
@@ -154,6 +188,14 @@ impl<T: Copy, const S: usize> Pool<T, S> {
     pub fn blocks(&self, p: usize) -> impl Iterator<Item = &[T]> {
         self.done[p].iter().copied().chain(self.open(p)).map(|(b, n)| unsafe { std::slice::from_raw_parts(b, n as usize) })
     }
+}
+
+/// Orders the non-temporal stores before the reads that follow.
+fn fence() {
+    #[cfg(target_feature = "avx2")]
+    unsafe {
+        std::arch::x86_64::_mm_sfence()
+    };
 }
 
 /// `S` bytes to the 64-byte-aligned `dst` with non-temporal stores (a plain copy without AVX2): the first
@@ -258,6 +300,24 @@ mod tests {
         round_trip::<3, 192>();
         round_trip::<4, 64>();
         round_trip::<4, 256>();
+    }
+
+    #[test]
+    fn paired_pools() {
+        let (mut a, mut b): (Pool<[u64; 2], 64>, Pool<[u32; 4], 64>) = (Pool::new(3), Pool::new(3));
+        for i in 0..7000u64 {
+            a.push2(&mut b, (i % 3) as usize, [i, 1], [i as u32, 2, 3, 4]);
+        }
+        a.finish2(&mut b);
+        for p in 0..3 {
+            let got_a: Vec<[u64; 2]> = a.blocks(p).flatten().copied().collect();
+            let got_b: Vec<[u32; 4]> = b.blocks(p).flatten().copied().collect();
+            let want: Vec<u64> = (0..7000u64).filter(|i| (i % 3) as usize == p).collect();
+            assert_eq!(got_a.iter().map(|r| r[0]).collect::<Vec<_>>(), want);
+            assert_eq!(got_b.iter().map(|r| r[0] as u64).collect::<Vec<_>>(), want);
+            let (la, lb): (Vec<usize>, Vec<usize>) = (a.blocks(p).map(|s| s.len()).collect(), b.blocks(p).map(|s| s.len()).collect());
+            assert_eq!(la, lb);
+        }
     }
 
     #[test]
