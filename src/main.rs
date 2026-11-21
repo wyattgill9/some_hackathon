@@ -1,6 +1,10 @@
 //! Shopping Sessions: reads $DATA_DIR, writes $OUTPUT_DIR/{user_daily,campaign_daily}/part-0.parquet.
 //! rules.md is the spec; the comments name the rule each step implements.
+#[allow(dead_code)]
+mod key;
 mod parse;
+#[allow(dead_code)]
+mod parquet;
 
 use std::fs;
 use std::hash::BuildHasher;
@@ -11,7 +15,7 @@ use std::time::Instant;
 
 use foldhash::HashMap;
 use arrow_array::{ArrayRef, Date32Array, Int64Array, RecordBatch, StringArray};
-use parquet::arrow::ArrowWriter;
+use ::parquet::arrow::ArrowWriter;
 use rayon::prelude::*;
 
 const DAY: i64 = 86_400_000;

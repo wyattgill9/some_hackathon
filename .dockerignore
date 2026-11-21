@@ -4,3 +4,5 @@ out/
 *.md
 .git
 target/
+ref/
+competitors/

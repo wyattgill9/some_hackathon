@@ -1,0 +1,23 @@
+# The frozen reference pipeline (the first, slow, verified implementation). It is the oracle the fast
+# pipeline is diffed against on seeds with no published answer. Never shipped, never edited.
+[package]
+name = "ref-pipeline"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "ref"
+path = "src/main.rs"
+
+[dependencies]
+arrow-array = "60.1.0"
+arrow-schema = "60.1.0"
+parquet = { version = "60.1.0", default-features = false, features = ["arrow"] }
+rayon = "1.12.0"
+foldhash = "0.2.0"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"

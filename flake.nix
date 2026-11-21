@@ -18,7 +18,7 @@
           pkgs.rustc
           pkgs.clippy
           pkgs.gnumake
-          (pkgs.python3.withPackages (p: [ p.polars ]))  # scripts/run_fixtures.py and compare.py
+          (pkgs.python3.withPackages (p: [ p.polars p.pyarrow p.duckdb ]))  # harness scripts; pyarrow/duckdb cross-check our Parquet
         ];
       };
     };
