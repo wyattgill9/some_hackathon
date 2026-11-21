@@ -222,7 +222,7 @@ impl<'a> Worker<'a> {
         }
         prefix(&self.bcounts, &mut self.boffs);
         let est = if self.ev_seen == 0 { n / 4 } else { n * self.np_seen / self.ev_seen + n / 32 };
-        let mut cap = (est * 2 + 2).next_power_of_two().max(1024);
+        let mut cap = (est + est / 2 + 2).next_power_of_two().max(1024);
         let np = loop {
             if self.table.len() != cap {
                 self.table.clear();
@@ -385,7 +385,7 @@ impl<'a> Worker<'a> {
                         break s.li;
                     }
                     if s.key == 0 {
-                        if np * 2 == cap {
+                        if np * 10 >= cap * 7 {
                             full = true;
                             break 'all;
                         }
