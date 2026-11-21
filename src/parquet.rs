@@ -64,6 +64,18 @@ impl<T: Copy> Buf<T> {
     pub fn as_slice(&self) -> &[T] {
         unsafe { std::slice::from_raw_parts(self.p, self.len) }
     }
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+    /// Faults the first `bytes` in now (one touch a page), so a later writer does not stall on fresh pages.
+    pub fn prefault(&mut self, bytes: usize) {
+        let bytes = bytes.min(self.cap * size_of::<T>());
+        self.reserve(bytes / size_of::<T>());
+        for off in (0..bytes).step_by(4096) {
+            unsafe { self.p.cast::<u8>().add(off).write_volatile(0) };
+        }
+        self.len = 0;
+    }
 }
 
 impl Buf<u8> {
@@ -134,17 +146,17 @@ pub fn def_levels(bits: &[u8], n: usize) -> Vec<u8> {
     out
 }
 /// DELTA_BINARY_PACKED: blocks of 128 deltas in 4 miniblocks of 32, each bit-packed at its own width.
-pub fn delta<T: Copy + Into<i64>>(vals: &[T]) -> Buf<u8> {
+/// Encoded into `out` (cleared first; at most `delta_bound(n)` bytes, reserved as written).
+pub fn delta<T: Copy + Into<i64>>(vals: &[T], out: &mut Buf<u8>) {
     let n = vals.len();
-    // Worst case 8 bytes a value plus 14 of block header per 128 values; populated as written.
-    let mut out = Buf::new(n * 8 + n / 128 * 14 + 64);
+    out.clear();
     out.reserve(32);
-    varint(&mut out, 128);
-    varint(&mut out, 4);
-    varint(&mut out, n as u64);
+    varint(out, 128);
+    varint(out, 4);
+    varint(out, n as u64);
     // The first value is written even for an empty column: readers may take it as part of the header.
     let mut prev = vals.first().map_or(0, |&v| v.into());
-    zigzag(&mut out, prev);
+    zigzag(out, prev);
     let mut i = 1;
     while i < n {
         let chunk = &vals[i..n.min(i + 128)];
@@ -157,7 +169,7 @@ pub fn delta<T: Copy + Into<i64>>(vals: &[T]) -> Buf<u8> {
             prev = v;
             min = min.min(*b);
         }
-        zigzag(&mut out, min);
+        zigzag(out, min);
         // Deltas less the minimum; the padding past the chunk stays 0 and never raises a width.
         let mut u = [0u64; 128];
         for (x, &d) in u.iter_mut().zip(&blk[..chunk.len()]) {
@@ -170,11 +182,15 @@ pub fn delta<T: Copy + Into<i64>>(vals: &[T]) -> Buf<u8> {
         }
         out.extend(&widths);
         for (m, &w) in widths.iter().enumerate().take(used) {
-            pack32(&mut out, &u[m * 32..m * 32 + 32], w as u32);
+            pack32(out, &u[m * 32..m * 32 + 32], w as u32);
         }
         i += chunk.len();
     }
-    out
+}
+
+/// The most bytes `delta` writes for `n` values: 8 a value plus 14 of block header per 128.
+pub fn delta_bound(n: usize) -> usize {
+    n * 8 + n / 128 * 14 + 64
 }
 
 /// 32 values bit-packed LSB first at width `w`: exactly `4 * w` bytes.
@@ -442,13 +458,13 @@ mod tests {
                 sess.push((i as i32 * 7919) % 1000);
                 rev.push(if i % 5 == 0 { (i as i64) << 40 } else { -(i as i64) });
             }
-            let (idl, topl, dayd, sessd, revd) = (
-                delta(&idlen),
-                delta(&toplen),
-                delta(&days),
-                delta(&sess),
-                delta(&rev),
-            );
+            let enc = |v: &[i64]| {
+                let mut b = Buf::new(delta_bound(v.len()));
+                delta(v, &mut b);
+                b
+            };
+            let i64s = |v: &[i32]| v.iter().map(|&x| x as i64).collect::<Vec<i64>>();
+            let (idl, topl, dayd, sessd, revd) = (enc(&i64s(&idlen)), enc(&i64s(&toplen)), enc(&i64s(&days)), enc(&i64s(&sess)), enc(&rev));
             let def = def_levels(&bits, rows);
             let user = [
                 Column { name: "user_id", kind: Kind::Str, enc: Enc::Delta, optional: false, parts: &[idl.as_slice(), &idbytes] },

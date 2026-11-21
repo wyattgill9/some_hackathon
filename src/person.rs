@@ -141,6 +141,9 @@ pub struct Worker<'a> {
     ctmp_li: Vec<u32>,
     csorted: Vec<[u64; 2]>,
     out: Out,
+    /// The encoded user_daily columns (see `UserFile::write`), mapped and prefaulted up front so the encoding
+    /// at the end never waits for fresh pages.
+    enc: [Buf<u8>; 7],
 }
 
 impl<'a> Worker<'a> {
@@ -169,6 +172,15 @@ impl<'a> Worker<'a> {
             ctmp: Vec::new(),
             ctmp_li: Vec::new(),
             csorted: Vec::new(),
+            enc: {
+                let bound = parquet::delta_bound(rows);
+                let mut enc = [Buf::new(bound), Buf::new(bound), Buf::new(bound), Buf::new(bound), Buf::new(bound), Buf::new(rows / 8 + 64), Buf::new(bound)];
+                let r = rows / 2; // about 1.5x the rows expected, at the bytes a row usually encodes to
+                for (b, bytes) in enc.iter_mut().zip([r, r, r, r, 3 * r, rows / 8 + 64, r]) {
+                    b.prefault(bytes);
+                }
+                enc
+            },
             out: Out {
                 sessions: Vec::new(),
                 day_first: Vec::new(),
@@ -414,12 +426,18 @@ impl<'a> Worker<'a> {
         let assisted = self.out.assisted.iter().copied().chain(std::iter::repeat(0));
         let cells = self.out.cells.iter().zip(assisted).map(|(c, a)| Cell { sessions: c.sessions, purchasing: c.purchasing, assisted: a, revenue: c.revenue }).collect();
         let r = self.out.rows;
-        let d = parquet::delta::<i32>;
+        let mut enc = self.enc;
+        let [idl, day, sess, ev, rev, defb, topl] = &mut enc;
+        parquet::delta(r.idlen.as_slice(), idl);
+        parquet::delta(r.day.as_slice(), day);
+        parquet::delta(r.sessions.as_slice(), sess);
+        parquet::delta(r.events.as_slice(), ev);
+        parquet::delta(r.revenue.as_slice(), rev);
+        parquet::delta(r.toplen.as_slice(), topl);
         let def = parquet::def_levels(r.present.as_slice(), r.n);
-        let mut defb = Buf::new(def.len());
+        defb.clear();
         defb.reserve(def.len());
         defb.extend(&def);
-        let enc = [d(r.idlen.as_slice()), d(r.day.as_slice()), d(r.sessions.as_slice()), d(r.events.as_slice()), parquet::delta(r.revenue.as_slice()), defb, d(r.toplen.as_slice())];
         (cells, r.n, UserFile { rows: r, enc })
     }
 }
