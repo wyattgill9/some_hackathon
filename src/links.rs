@@ -6,7 +6,7 @@
 //! a branch; only a full line sends it on to the next.
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 
-use crate::key::{self, Key, mix};
+use crate::key::{self, Key};
 use crate::parallel;
 use crate::pool::map_huge;
 
@@ -16,6 +16,14 @@ type Line = [u64; 8];
 pub struct Links {
     table: &'static [Line], // Huge pages: lookups are random and prefetched.
     mask: usize,            // line index mask
+    shift: u32,             // 64 - line index bits
+}
+
+/// The home line of a key: the top bits of a Fibonacci multiply (two instructions; computed once to prefetch
+/// and once to look up).
+#[inline(always)]
+fn home(k: Key, shift: u32) -> usize {
+    (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> shift) as usize
 }
 
 /// A zeroed, huge-page-backed slice that lives until exit.
@@ -37,6 +45,7 @@ impl Links {
         let cap = (n * 4).next_power_of_two().max(16); // slots: at most 2 IDs per edge, at most half full
         let lines = cap / 4;
         let mask = lines - 1;
+        let shift = 64 - lines.trailing_zeros();
         // The IDs go straight into the final table's lines (as atomics while the threads insert); the names
         // half is filled at the end. Slot s = line s / 4, entry s % 4.
         let table: &[[AtomicU64; 8]] = huge_slice(lines);
@@ -52,7 +61,7 @@ impl Links {
         // it. A key moves past a line only when all 4 entries hold other keys, and occupancy only grows, so a
         // lookup that stops at the first line with an empty entry sees every key.
         let slot = |k: Key| -> u32 {
-            let mut line = (mix(k) >> 32) as usize & mask;
+            let mut line = home(k, shift);
             loop {
                 for (j, e) in table[line][..4].iter().enumerate() {
                     match e.compare_exchange(0, k, Relaxed, Relaxed) {
@@ -85,8 +94,8 @@ impl Links {
             for (i, batch) in batches.iter().enumerate() {
                 if let Some(next) = batches.get(i + 1) {
                     for &(a, b) in *next {
-                        prefetch(table[(mix(a) >> 32) as usize & mask].as_ptr() as *const u8);
-                        prefetch(table[(mix(b) >> 32) as usize & mask].as_ptr() as *const u8);
+                        prefetch(table[home(a, shift)].as_ptr() as *const u8);
+                        prefetch(table[home(b, shift)].as_ptr() as *const u8);
                     }
                 }
                 for (j, &(a, b)) in batch.iter().enumerate() {
@@ -124,19 +133,19 @@ impl Links {
         });
         // Every thread's writes are complete (joined); the atomics are read as plain words from here on.
         let table: &'static [Line] = unsafe { std::slice::from_raw_parts(table.as_ptr() as *const Line, lines) };
-        Links { table, mask }
+        Links { table, mask, shift }
     }
 
     #[inline(always)]
     pub fn prefetch(&self, k: Key) {
-        prefetch(self.table[(mix(k) >> 32) as usize & self.mask].as_ptr() as *const u8);
+        prefetch(self.table[home(k, self.shift)].as_ptr() as *const u8);
     }
 
     /// The person's name: the root of a linked ID, or the ID itself. Whether an ID is linked is a coin toss
     /// per line, so the usual line is resolved without a branch on it.
     #[inline(always)]
     pub fn lookup(&self, k: Key) -> Key {
-        let mut line = (mix(k) >> 32) as usize & self.mask;
+        let mut line = home(k, self.shift);
         loop {
             let l = &self.table[line];
             let (hit, empty) = matches(l, k);
