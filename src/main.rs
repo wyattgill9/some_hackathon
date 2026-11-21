@@ -76,7 +76,8 @@ pub struct Ctx {
     pub cws: i64,
     pub day0: i64,
     pub ndays: usize,
-    pub bits: u32,
+    pub ebits: u32, // event partitions (by event_id): 2^ebits
+    pub pbits: u32, // person partitions (clicks, surviving events): 2^pbits
     pub ncamp: usize,
     pub cats: Vec<Vec<u8>>,
     pub unknown: u32,
@@ -151,13 +152,18 @@ fn main() {
     let click_files = reader::open_dir(&data.join("clicks"));
     let link_files = reader::open_dir(&data.join("links"));
     let event_bytes: u64 = event_files.iter().map(|f| f.1).sum();
-    // Partitions of about 2 MiB of CSV each: every later phase works on one in cache.
-    let bits = env("SS_PBITS").map_or(((event_bytes >> 21).next_power_of_two().trailing_zeros()).clamp(4, 11), |b| b as u32);
-    let parts = 1usize << bits;
+    // Person partitions of about 2 MiB of CSV each: the people phase works on one in cache. Event partitions
+    // (by event_id, for dedup) are capped at 2^10: every one costs the parse phase two staging lines per
+    // thread, and its L2 is shared with a sibling thread on the scorer; dedup's table scales with the
+    // partition (60M at 2^10: 512 KiB), which measured cheaper than the parse state (60M: L2 misses -11%,
+    // cycles equal, wall -3%).
+    let bits = ((event_bytes >> 21).next_power_of_two().trailing_zeros()).clamp(4, 11);
+    let (ebits, pbits) = (env("SS_EBITS").map_or(bits.min(10), |b| b as u32), env("SS_PBITS").map_or(bits, |b| b as u32));
+    let (eparts, pparts) = (1usize << ebits, 1usize << pbits);
     // 128 KiB ranges: a thread's read buffer plus its open partition stages must share a 1 MiB L2 with its
     // SMT sibling on the scorer (neutral on a private-L2 desktop).
     let range = env("SS_RANGE").unwrap_or(128 << 10);
-    let ctx = Ctx { ws, we, cws, day0, ndays, bits, ncamp, cats: cats.iter().map(|c| c.to_vec()).collect(), unknown };
+    let ctx = Ctx { ws, we, cws, day0, ndays, ebits, pbits, ncamp, cats: cats.iter().map(|c| c.to_vec()).collect(), unknown };
     fs::create_dir_all(out.join("user_daily")).unwrap();
     fs::create_dir_all(out.join("campaign_daily")).unwrap();
     lap("setup");
@@ -190,8 +196,8 @@ fn main() {
             camp_num: &camp_num,
             links: &links,
             tc: TsCache::default(),
-            evs: (Pool::new(parts), Pool::new(parts)),
-            cks: Pool::new(parts),
+            evs: (Pool::new(eparts), Pool::new(eparts)),
+            cks: Pool::new(pparts),
             epipe: Pipe::default(),
             cpipe: Pipe::default(),
         };
@@ -218,15 +224,15 @@ fn main() {
     let next = AtomicUsize::new(0);
     let ev2: Vec<Pool<Ev2, EV_STAGE>> = parallel(threads, |_| {
         let (mut table, mut dropped) = (Vec::new(), Vec::new());
-        let mut out = Pool::<Ev2, EV_STAGE>::new(parts);
+        let mut out = Pool::<Ev2, EV_STAGE>::new(pparts);
         loop {
             let p = next.fetch_add(1, Ordering::Relaxed);
-            if p >= parts {
+            if p >= eparts {
                 break;
             }
             let keys: Vec<&[EvKey]> = evk.iter().flat_map(|t| t.blocks(p)).collect();
             let pays: Vec<&[Ev2]> = evp.iter().flat_map(|t| t.blocks(p)).collect();
-            dedup(&keys, &pays, &mut table, &mut dropped, bits, &mut out);
+            dedup(&keys, &pays, &mut table, &mut dropped, pbits, &mut out);
             for b in keys.iter().map(|b| b.as_ptr() as *mut u8).chain(pays.iter().map(|b| b.as_ptr() as *mut u8)) {
                 out.recycle(b);
             }
@@ -238,7 +244,7 @@ fn main() {
 
     // People per person partition, largest first; each worker writes its own user_daily file. Its cells and
     // row count go to the main thread first, which writes campaign_daily while the user files are written.
-    let mut order: Vec<usize> = (0..parts).collect();
+    let mut order: Vec<usize> = (0..pparts).collect();
     order.sort_by_key(|&q| std::cmp::Reverse(ev2.iter().map(|t| t.len(q)).sum::<usize>()));
     let next = AtomicUsize::new(0);
     let (tx, rx) = std::sync::mpsc::channel::<(Vec<Cell>, usize)>();
@@ -409,7 +415,7 @@ impl Parser<'_> {
     /// The key and payload streams of the event's partition, pushed as a pair.
     #[inline(always)]
     fn emit_ev(&mut self, e: Ev) {
-        let p = key::part(e.key.eid, self.ctx.bits);
+        let p = key::part(e.key.eid, self.ctx.ebits);
         // The payload is built in registers: a wide load of a record patched in memory would wait for the patch.
         let pay = Ev2 { person: self.links.lookup(e.pay.person), ts: e.pay.ts, pay: e.pay.pay };
         self.evs.0.push2(&mut self.evs.1, p, e.key, pay);
@@ -418,7 +424,7 @@ impl Parser<'_> {
     #[inline(always)]
     fn emit_ck(&mut self, c: Ck) {
         let person = self.links.lookup(c.person);
-        self.cks.push(key::part(person, self.ctx.bits), Ck { person, cid: c.cid, ts: c.ts, camp: c.camp });
+        self.cks.push(key::part(person, self.ctx.pbits), Ck { person, cid: c.cid, ts: c.ts, camp: c.camp });
     }
 
     fn finish(mut self) -> (Pool<EvKey, EV_STAGE>, Pool<Ev2, EV_STAGE>, Pool<Ck, CK_STAGE>) {
