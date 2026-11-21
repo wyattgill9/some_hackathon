@@ -1,7 +1,5 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
 ## What this is
 
 A Databricks Buildathon entry for "Shopping Sessions": clean dirty click-stream CSVs in `/data`, merge linked user IDs into people, sessionize, attribute sessions to ad clicks, and write two Parquet tables to `/output/user_daily/` and `/output/campaign_daily/`. **The score is container wall time (lower is better), and any wrong row scores nothing.** Correctness comes first; after that, everything is about speed.
@@ -10,26 +8,21 @@ A Databricks Buildathon entry for "Shopping Sessions": clean dirty click-stream 
 
 ## Repo state
 
-So far the repo holds only `rules.md` and the challenge zips. **No engine has been chosen yet.**
-- `starter-{duckdb,polars,pyspark}.zip`: skeletons that write empty tables. Each has a `Dockerfile`, `run.sh`, `pipeline/pipeline.py`, `Makefile`, `scripts/` and the 36 `fixtures/`. The `scripts/` and `fixtures/` are identical across the three starters.
-- `generator.zip`: Rust source for `generate`, which builds datasets of any size and seed.
-- `dev-answer.zip`: the expected CSVs for the dev set (seed 1, 1M events, 250k clicks).
+The challenge zips are extracted. **No engine has been chosen yet, so there is no root `Dockerfile`.**
+- `Makefile`, `scripts/`, `fixtures/` (the 36 cases), `.dockerignore`: the shared starter harness. It is identical in all three starters.
+- `starters/{duckdb,polars,pyspark}/`: each starter's engine-specific `Dockerfile`, `run.sh`, `pipeline/`, `requirements.txt` and README. The pyspark `run.sh`/README holds the JVM-in-container workarounds. Copy one to the root, or write your own, once you pick an engine.
+- `generator/`: Rust source for `generate` (std only). The flake builds it with plain `rustc` because its `Cargo.lock` is stale.
+- `dev-answer/`: the expected CSVs for the dev set (seed 1, 1M events, 250k clicks).
 
 Submission requirements: a public GitHub repo with a `Dockerfile` **at the repo root**, at most 50 MB, and no data checked in. Never commit `dev/`, `out/`, generated datasets or `target/`. Every submitted commit must stay in the history until results are out.
 
 ## Local environment (NixOS)
 
-`python3`, `unzip`, `docker`, `cargo` and `duckdb` are **not** on PATH, and there is no `NIX_PATH` channel, so `nix-shell -p` needs `-I nixpkgs=flake:nixpkgs`:
+Use the flake dev shell (`direnv allow`, or `nix develop`). It provides `generate`, `make` and `python3` with polars, which is all the harness needs. Outside it, `python3`, `make` and `docker` are not on PATH. Docker needs a system-level daemon (`virtualisation.docker.enable`), so a flake can't supply it. Add engine dependencies to `flake.nix` once an engine is chosen. Flakes see only git-tracked files, so `git add` new files before `nix develop` can find them.
 
-```sh
-nix run nixpkgs#unzip -- -qo starter-duckdb.zip -d .                                    # extract a starter
-nix-shell -I nixpkgs=flake:nixpkgs -p 'python3.withPackages(p: [p.polars p.duckdb])'   # test scripts need polars
-nix-shell -I nixpkgs=flake:nixpkgs -p cargo rustc --run 'cargo build --release'        # build the generator (Rust >= 1.85)
-```
+nixpkgs ships polars 1.42. The starters pin `polars==2.1.0` and `duckdb==1.5.6`, so confirm any engine behavior you rely on inside the Docker image.
 
-nixpkgs ships polars 1.42 and duckdb 1.5.5. The starters pin `polars==2.1.0` and `duckdb==1.5.6`, so confirm any engine behavior you rely on inside the Docker image.
-
-## Commands (from the starter Makefile/scripts, once a starter is extracted to the root)
+## Commands (`build`, `fixtures` and `run-dev` need Docker and a root `Dockerfile`)
 
 ```sh
 make build                     # docker buildx build --platform linux/amd64 -t shopping-sessions:latest .

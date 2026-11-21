@@ -1,0 +1,98 @@
+# Shopping Sessions: PySpark starter (skeleton)
+
+This repository is a working skeleton, not a complete solution. It builds a `linux/amd64` image with Java and PySpark, starts Spark inside the scorer's container limits with the JVM workarounds already set up, reads the inputs, and writes both output tables with the right schema. Both tables are empty, so the checker marks this skeleton incorrect until you implement the rules in `rules.md`.
+
+`rules.md` defines the inputs, cleaning, linked IDs, sessions, attribution, assists, and outputs. If this starter and `rules.md` ever disagree, `rules.md` wins. Ask the organizers if `rules.md` leaves you unsure.
+
+## What to do first
+
+- Read `rules.md` for the full rules.
+- Write your pipeline in `pipeline/pipeline.py`. The TODO lists the steps in order.
+- Build the image and test against all 36 edge-case fixtures and the 1M-event dev set before submitting.
+
+## Run and test locally
+
+You need Docker with buildx, and Python 3.10+ with `polars` for the test scripts. Install it with `pip install polars`.
+
+Build the image and run all 36 fixtures:
+
+```sh
+make build        # docker buildx build --platform linux/amd64 --load -t shopping-sessions:latest .
+make fixtures     # runs the image on all 36 fixtures with scorer flags, diffs each against expected/
+```
+
+Build, run, and check the 1M-event dev set. `make dev` needs `generate` on your PATH: build it from the track page's generator.zip (Rust 1.85 or newer; its README has the two commands).
+
+```sh
+make dev                                # generate --seed 1 --events 1000000 --clicks 250000 --output dev
+make run-dev                            # runs your image on dev/ with scorer flags and times it
+make check-dev                          # exact diff against dev-answer/, the track page's dev-answer.zip unzipped here
+```
+
+If your laptop cannot spare 8 cores and 24 GB, run with lower limits using `make run-dev CPUS=4 MEM=8g`. Your local times will not match the scorer anyway; only the board's times count.
+
+- **x86 Linux and Windows machines.** Build and run the amd64 image natively.
+- **Apple-silicon Macs.** Emulating amd64 is slow. For fast local loops, build a native image with `make build run-dev PLATFORM=linux/arm64`. The Dockerfile pins no platform, so it builds either way. Check the amd64 image before you submit.
+
+To iterate on logic without Docker, run the pipeline directly on your machine:
+
+```sh
+pip install pyspark==4.0.1      # needs Java 17+
+python3 scripts/run_fixtures.py fixtures -- python3 pipeline/pipeline.py
+```
+
+The scorer's smoke test runs your image on real amd64 hardware first. If something breaks only on amd64, you will see it there with your logs.
+
+## Submitting and scoring
+
+Submit your public GitHub repository on the Buildathon track page. Enter a commit SHA to score a specific revision, or leave it empty to score the newest commit on the default branch.
+
+The image's `CMD` runs with no arguments. Exit code 0 means "done, check my output". Build time is never timed; only the run is timed. The track page lists the current practice limits and how the final is scored.
+
+## Container limits
+
+Scorers are Google Cloud n2 Intel Xeon machines, Cascade Lake or newer, with AVX-512 available. Your container gets:
+
+| Resource | Setting |
+| --- | --- |
+| `/data` | The dataset, read-only |
+| `/output` | Empty, writable. Write `/output/user_daily/` and `/output/campaign_daily/` as Parquet |
+| `/scratch` | Empty, writable, fast local disk for spills and temp files |
+| CPU / RAM | 8 vCPUs, hyperthreads of an Intel Xeon, 24 GB, no swap |
+| Network | None |
+| Env vars | `DATA_DIR=/data`, `OUTPUT_DIR=/output`, `SCRATCH_DIR=/scratch`, `HOME=/scratch`, `NCPU=8`, `MEM_GB=24` |
+| Filesystem | Root is read-only apart from `/tmp`, 64 MB in memory. The process runs as uid 1000, not root |
+
+## Switching engines
+
+You may use any engine that runs inside the container: DuckDB, Polars, Rust, C++, Spark, or hand-written Python. Replace `pipeline/`, `requirements.txt`, and `Dockerfile` as you like, and keep these four requirements:
+
+1. Build for `linux/amd64`. All wheels and binaries must have amd64 (x86-64) builds; AVX-512 is available.
+2. Make `CMD` run your pipeline with no arguments and exit 0 on success.
+3. Write nothing outside `/output` and `/scratch`, because root is read-only. Point temp directories at `/scratch`; `run.sh` shows how.
+4. Use no network at run time. Install all dependencies at build time.
+
+## Common pitfalls
+
+- **The JVM crashes with `--network none`.** Without a network, the container's hostname does not resolve, and Java, including Spark and log4j, fails looking it up. `run.sh` writes a hosts file to `/scratch` and points Java at it with `-Djdk.net.hosts.file`. Keep this if you stay on Spark or any JVM engine.
+- **uid 1000 has no home.** Without one, Spark fails with `basedir must be absolute: ?/.ivy2`. The Dockerfile creates a user for uid 1000 with `/scratch` as home, and `run.sh` sets `HOME` and `-Duser.home`.
+- **Spark splits lines on `\r` by default.** Pass `lineSep="\n"`. The input data uses only `\n`, so set Spark to read lines on `\n` only.
+- **`\d` is not `[0-9]`.** In several regex engines, including Rust's, `\d` matches any Unicode digit. The rules mean ASCII digits only.
+- **Spark recomputes `withColumn` expressions.** A `withColumn` followed by several filters can evaluate the same expensive expression many times per row. Writing intermediate results to `/scratch` and reading them back stops that, at the cost of extra I/O.
+- **The JVM skips JIT compilation for methods over 8 KB.** Spark generates large methods that would otherwise run interpreted. `run.sh` already passes `-XX:-DontCompileHugeMethods`, which made a full solution about 1.4× faster.
+- **Large Spark expressions can fail code generation.** If you see a wall of `CodeGenerator` errors in the log, split the expression up.
+- **Extra files in output folders.** `_SUCCESS` and other non-Parquet files in the output folders are ignored, so Spark's default writer works.
+- **Other CSV readers also differ from `rules.md`.** Polars' and DuckDB's built-in CSV readers each repair quoting and malformed lines their own way. Test against the fixtures before relying on one.
+
+## Self-checks
+
+- Summed over all rows, `sessions` and `revenue_cents` are equal in both tables.
+- `day` must be a Parquet `DATE`, not a string or timestamp.
+- Row order and the number of Parquet files do not matter. Exact column names do, and there must be no extra columns.
+
+## Files in this starter
+
+- `pipeline/pipeline.py` holds your pipeline code.
+- `Dockerfile` builds a `linux/amd64` image for the Intel Xeon scorers.
+- `fixtures/` holds the 36 edge cases from `rules.md`, each an `input/` folder and the `expected/` tables. In this monorepo they live in `../../fixtures`; copy them in when publishing the starter as its own repo.
+- `scripts/` runs your image the way the scorer does and diffs the output.

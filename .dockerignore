@@ -1,0 +1,5 @@
+fixtures/
+dev/
+out/
+*.md
+.git
