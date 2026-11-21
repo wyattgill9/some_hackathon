@@ -11,17 +11,19 @@ COPY generator ./generator
 ENV BASE="-C target-cpu=cascadelake -C target-feature=+crt-static,-avx512f -C no-vectorize-slp -C llvm-args=-x86-branches-within-32B-boundaries"
 ENV TARGET="x86_64-unknown-linux-gnu"
 # Profile-guided build: an instrumented binary runs on a 2M-event set from the track's own generator, and
-# the final binary is compiled with that profile. Any failure along the way falls back to a plain build.
-RUN (rustup component add llvm-tools \
-     && RUSTFLAGS="$BASE -Cprofile-generate=/tmp/pgo" cargo build --release --locked --target $TARGET --target-dir /tmp/instrumented \
-     && rustc --edition 2024 -O -C panic=abort generator/src/main.rs -o /tmp/generate \
-     && /tmp/generate --seed 11 --events 2000000 --clicks 500000 --output /tmp/train >/dev/null \
-     && mkdir -p /tmp/out \
-     && DATA_DIR=/tmp/train OUTPUT_DIR=/tmp/out NCPU=8 /tmp/instrumented/$TARGET/release/pipeline \
-     && "$(rustc --print sysroot)/lib/rustlib/$TARGET/bin/llvm-profdata" merge -o /tmp/pgo.profdata /tmp/pgo/*.profraw \
-     && RUSTFLAGS="$BASE -Cprofile-use=/tmp/pgo.profdata" cargo build --release --locked --target $TARGET \
-     && echo "PGO build") \
- || (echo "PGO failed: plain build" && RUSTFLAGS="$BASE" cargo build --release --locked --target $TARGET)
+# the final binary is compiled with that profile. Any failure along the way FAILS the build: a plain binary
+# is ~10% slower, and a silent fallback once cost a submission. (To ship without PGO, build with
+# RUSTFLAGS="$BASE" by hand.)
+RUN rustup component add llvm-tools \
+ && RUSTFLAGS="$BASE -Cprofile-generate=/tmp/pgo" cargo build --release --locked --target $TARGET --target-dir /tmp/instrumented \
+ && rustc --edition 2024 -O -C panic=abort generator/src/main.rs -o /tmp/generate \
+ && /tmp/generate --seed 11 --events 2000000 --clicks 500000 --output /tmp/train >/dev/null \
+ && mkdir -p /tmp/out \
+ && DATA_DIR=/tmp/train OUTPUT_DIR=/tmp/out NCPU=8 /tmp/instrumented/$TARGET/release/pipeline \
+ && "$(rustc --print sysroot)/lib/rustlib/$TARGET/bin/llvm-profdata" merge -o /tmp/pgo.profdata /tmp/pgo/*.profraw \
+ && test -s /tmp/pgo.profdata \
+ && RUSTFLAGS="$BASE -Cprofile-use=/tmp/pgo.profdata" cargo build --release --locked --target $TARGET \
+ && echo "PGO build"
 RUN cp target/$TARGET/release/pipeline /pipeline
 
 FROM scratch
