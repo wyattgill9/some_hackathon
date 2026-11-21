@@ -10,6 +10,6 @@ reference implementations, and their CLAUDE.md/AGENTS.md agent files were remove
 | deltaparticle_Databricks-Buildathon | C++ (shipped) + Rust (reference) | "scored 0.66" (Dremix10 @ 954c08d) | cpp/main.cpp, README.md, competitors-bench.yml (GH Actions job that benchmarks other repos' images) |
 | Vibhor7-7_shopping-sessions | Rust | team VibDiv, #13, 0.78 s | SUBMISSIONS.md, BENCH.md, src/ |
 | NhanHu_Test | Rust | unscored; commit claims under 0.55 s locally | README.md (design summary), src/ |
-| cherylaurelia_builders-hackathon | Rust | unscored; ~0.39-0.46 s local, fastest public build nimaibhat measured | src/main.rs (single file) |
+| cherylaurelia_builders-hackathon | Rust | likely the 0.58 -> 0.48 s board record (Nov 21 ~07:20Z, unconfirmed); snapshot is branch cand/02af107, not main | CHANGES.md (30 commit messages with A/B numbers), src/main.rs (single file) |
 
 Do not copy code into our entry without checking the reuse policy with the organizers (deltaparticle claims an "open-reuse policy"; our rules.md doesn't mention one).

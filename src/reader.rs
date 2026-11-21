@@ -168,9 +168,9 @@ mod tests {
         for trailing_newline in [true, false] {
             let mut data = b"header\n".to_vec();
             let mut lines = Vec::new();
-            for _ in 0..300 {
+            for _ in 0..600 {
                 let n = (next() % 24) as usize;
-                let line: Vec<u8> = (0..n).map(|_| b"a,,\"\"\"\r\0\xc3,"[(next() % 10) as usize]).collect();
+                let line: Vec<u8> = (0..n).map(|_| b"aaaaa,,\"\r\0\xc3"[(next() % 11) as usize]).collect();
                 data.extend_from_slice(&line);
                 data.push(b'\n');
                 lines.push(line);
@@ -183,7 +183,7 @@ mod tests {
                 .filter_map(|l| parse::fields::<3>(l))
                 .map(|fs| fs.iter().map(|f| f.to_vec()).collect())
                 .collect();
-            assert!(want.len() > 20, "the generated lines should include well-formed ones");
+            assert!(want.len() > 10, "the generated lines should include well-formed ones");
             let path = std::env::temp_dir().join(format!("reader-test-{}-{trailing_newline}", std::process::id()));
             File::create(&path).unwrap().write_all(&data).unwrap();
             let file = File::open(&path).unwrap();

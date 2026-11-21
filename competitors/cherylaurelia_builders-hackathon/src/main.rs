@@ -1,7 +1,7 @@
 //! Shopping Sessions pipeline. rules.md is the spec; each phase names the rule it implements.
 //!
 //! One shuffle, no pointers into the input. Every ID (event, user, click) becomes an exact 64-bit key: an ID of up
-//! to 10 bytes from [0-9A-Z_a-z] packs losslessly, any other ID is interned. The input is read with pread into a
+//! to 9 ASCII bytes packs losslessly (7 bits a byte), any other ID is interned. The input is read with pread into a
 //! small per-thread buffer, so no input page is ever mapped; with a cold page cache a few extra threads ask the
 //! kernel for the whole input up front (`read_ahead`).
 //!
@@ -45,6 +45,12 @@ fn mix(mut x: u64) -> u64 {
     x ^ (x >> 33)
 }
 
+/// A hash to take the top bits of (a table slot, a bucket): one multiply, where `mix` is two and five more steps.
+#[inline(always)]
+fn spread(x: u64) -> u64 {
+    x.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
 #[inline]
 fn hash_bytes(b: &[u8]) -> u64 {
     const K: u64 = 0x9E3779B97F4A7C15;
@@ -81,91 +87,54 @@ type BytesMap<V> = HashMap<Bytes, V, BuildHasherDefault<BytesHasher>>;
 /// Bit 63 of a key: the ID did not pack, the rest is its number in the `Interner`.
 const INTERNED: u64 = 1 << 63;
 
-/// Byte -> digit 1..=63 for [0-9A-Z_a-z] in byte order, 0 for any other byte.
-const fn pack_table() -> [u8; 256] {
-    let mut t = [0u8; 256];
-    let mut d = 1u8;
-    let mut c = 0usize;
-    while c < 256 {
-        let b = c as u8;
-        if (b >= b'0' && b <= b'9') || (b >= b'A' && b <= b'Z') || b == b'_' || (b >= b'a' && b <= b'z') {
-            t[c] = d;
-            d += 1;
-        }
-        c += 1;
-    }
-    t
-}
-static PACK: [u8; 256] = pack_table();
-
-const fn unpack_table() -> [u8; 64] {
-    let p = pack_table();
-    let mut t = [0u8; 64];
-    let mut c = 0usize;
-    while c < 256 {
-        if p[c] != 0 {
-            t[p[c] as usize] = c as u8;
-        }
-        c += 1;
-    }
-    t
-}
-static UNPACK: [u8; 64] = unpack_table();
-
-/// An ID of 1..=10 bytes from [0-9A-Z_a-z] as a number: six bits a byte, first byte highest, zero filled.
-/// 0 = it does not pack. Digits rise with the byte values, so two packed IDs compare as their bytes do.
+/// An ID of 1..=9 bytes, each 1..=127 (ASCII, no NUL), as a number: seven bits a byte, first byte highest, zero
+/// filled. 0 = it does not pack. A byte is never 0, so the zero fill ends the ID: distinct IDs give distinct numbers,
+/// and two packed IDs compare as their bytes do.
 #[inline]
 fn pack(b: &[u8]) -> u64 {
-    if b.len() > 10 {
+    if b.len() > 9 {
         return 0;
     }
     let mut v = 0u64;
     for &c in b {
-        let d = PACK[c as usize];
-        if d == 0 {
+        if c == 0 || c >= 128 {
             return 0;
         }
-        v = (v << 6) | d as u64;
+        v = (v << 7) | c as u64;
     }
-    v << (6 * (10 - b.len()))
+    v << (7 * (9 - b.len()))
 }
 
-/// `pack` of the `len` bytes at `p`, for any `len`; 16 bytes must be readable.
-///
-/// The class of a byte comes from its two nibbles. With rows 3..=7 the high nibbles of the 63 bytes that pack, a
-/// byte packs when its low nibble is one the row of its high nibble allows: `LO[low] & HI[high] != 0`, one bit a
-/// row. Its digit is the byte less its row's offset (`_`, alone in its row, 4 more). The bytes past `len` may be
-/// anything: each digit is cut to its 6 bits, so it stays in its own place, and the places past `len` are cleared
-/// at the end.
+/// `pack` of the `len` bytes at `p`; 9 bytes at `p` must be readable.
 #[inline(always)]
 unsafe fn pack_at(p: *const u8, len: usize) -> u64 {
-    if len > 10 {
-        return 0;
-    }
-    #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1", target_feature = "ssse3"))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
     {
-        use std::arch::x86_64::*;
-        // rows 3 4 5 6 7 = bits 1 2 4 8 16; allowed low nibbles: 0..=9 | 1..=15 | 0..=10, 15 | 1..=15 | 0..=10
-        const LO: [u8; 16] = [0x15, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1E, 0x0A, 0x0A, 0x0A, 0x0A, 0x0E];
-        const HI: [u8; 16] = [0, 0, 0, 1, 2, 4, 8, 16, 0, 0, 0, 0, 0, 0, 0, 0];
-        const OFF: [u8; 16] = [0, 0, 0, 47, 54, 54, 59, 59, 0, 0, 0, 0, 0, 0, 0, 0];
-        let lut = |t: &[u8; 16]| _mm_loadu_si128(t.as_ptr() as *const __m128i);
-        let c = _mm_loadu_si128(p as *const __m128i);
-        let nib = _mm_set1_epi8(0x0F);
-        let hi = _mm_and_si128(_mm_srli_epi16(c, 4), nib);
-        let ok = _mm_and_si128(_mm_shuffle_epi8(lut(&LO), _mm_and_si128(c, nib)), _mm_shuffle_epi8(lut(&HI), hi));
-        let bad = _mm_movemask_epi8(_mm_cmpeq_epi8(ok, _mm_setzero_si128())) as u32;
-        if bad & ((1u32 << len) - 1) != 0 {
+        use std::arch::x86_64::{_bzhi_u64, _pext_u64};
+        const ONES: u64 = 0x0101_0101_0101_0101;
+        const HIGH: u64 = ONES << 7;
+        let lo = (p as *const u64).read_unaligned();
+        // Every byte of the ID must be 1..=127: none with its high bit set, none zero. `(x - ONES) & !x` has the
+        // high bit of every zero byte of x (and can only be wrong above one).
+        if len == 9 {
+            // nearly every ID: eight bytes and the ninth, which is 1..=127 when neither it nor it - 1 has bit 7
+            let b8 = *p.add(8) as u64;
+            if ((lo.wrapping_sub(ONES) & !lo) | lo | b8.wrapping_sub(1) | b8) & HIGH != 0 {
+                return 0;
+            }
+            // first byte highest: swap, then squeeze the seven low bits of each byte together
+            return (_pext_u64(lo.swap_bytes(), ONES * 0x7F) << 7) | b8;
+        }
+        if len.wrapping_sub(1) >= 8 {
             return 0;
         }
-        let us = _mm_and_si128(_mm_cmpeq_epi8(c, _mm_set1_epi8(b'_' as i8)), _mm_set1_epi8(4));
-        let d = _mm_and_si128(_mm_sub_epi8(c, _mm_add_epi8(_mm_shuffle_epi8(lut(&OFF), hi), us)), _mm_set1_epi8(63));
-        let w = _mm_maddubs_epi16(d, _mm_set1_epi16(0x0140)); // two digits -> 12 bits
-        let l = _mm_madd_epi16(w, _mm_set1_epi32(0x0001_1000)); // four digits -> 24 bits
-        let lo = _mm_cvtsi128_si64(l) as u64;
-        let l2 = _mm_extract_epi32(l, 2) as u32 as u64;
-        let k = ((lo & 0xffff_ffff) << 36) | ((lo >> 32) << 12) | (l2 >> 12);
-        return k & (u64::MAX << (60 - 6 * len)); // len 0: only bits never set are kept
+        // 1..=8 bytes: the bytes past `len` are cut from the ID and from the zero test
+        let n8 = 8 * len as u32;
+        let lo = _bzhi_u64(lo, n8);
+        if (_bzhi_u64(lo.wrapping_sub(ONES) & !lo, n8) | lo) & HIGH != 0 {
+            return 0;
+        }
+        return _pext_u64(lo.swap_bytes(), ONES * 0x7F) << 7;
     }
     #[allow(unreachable_code)]
     {
@@ -173,44 +142,7 @@ unsafe fn pack_at(p: *const u8, len: usize) -> u64 {
     }
 }
 
-/// (`pack_at(p1, l1)`, `pack_at(p2, l2)`): the two IDs of a line in the two halves of one 256-bit register.
-#[inline(always)]
-unsafe fn pack2_at(p1: *const u8, l1: usize, p2: *const u8, l2: usize) -> (u64, u64) {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    if l1 <= 10 && l2 <= 10 {
-        use std::arch::x86_64::*;
-        // the tables of `pack_at`, once per half
-        const LO: [u8; 16] = [0x15, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1E, 0x0A, 0x0A, 0x0A, 0x0A, 0x0E];
-        const HI: [u8; 16] = [0, 0, 0, 1, 2, 4, 8, 16, 0, 0, 0, 0, 0, 0, 0, 0];
-        const OFF: [u8; 16] = [0, 0, 0, 47, 54, 54, 59, 59, 0, 0, 0, 0, 0, 0, 0, 0];
-        let lut = |t: &[u8; 16]| _mm256_broadcastsi128_si256(_mm_loadu_si128(t.as_ptr() as *const __m128i));
-        let c = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(_mm_loadu_si128(p1 as *const __m128i)), _mm_loadu_si128(p2 as *const __m128i));
-        let nib = _mm256_set1_epi8(0x0F);
-        let hi = _mm256_and_si256(_mm256_srli_epi16(c, 4), nib);
-        let ok = _mm256_and_si256(_mm256_shuffle_epi8(lut(&LO), _mm256_and_si256(c, nib)), _mm256_shuffle_epi8(lut(&HI), hi));
-        let bad = _mm256_movemask_epi8(_mm256_cmpeq_epi8(ok, _mm256_setzero_si256())) as u32;
-        let us = _mm256_and_si256(_mm256_cmpeq_epi8(c, _mm256_set1_epi8(b'_' as i8)), _mm256_set1_epi8(4));
-        let d = _mm256_and_si256(_mm256_sub_epi8(c, _mm256_add_epi8(_mm256_shuffle_epi8(lut(&OFF), hi), us)), _mm256_set1_epi8(63));
-        let w = _mm256_maddubs_epi16(d, _mm256_set1_epi16(0x0140));
-        let l = _mm256_madd_epi16(w, _mm256_set1_epi32(0x0001_1000));
-        let key = |lo: u64, l2: u64, bad: u32, len: usize| {
-            let k = ((lo & 0xffff_ffff) << 36) | ((lo >> 32) << 12) | (l2 >> 12);
-            if bad & ((1u32 << len) - 1) != 0 {
-                0
-            } else {
-                k & (u64::MAX << (60 - 6 * len))
-            }
-        };
-        let (a, b) = (_mm256_castsi256_si128(l), _mm256_extracti128_si256::<1>(l));
-        return (
-            key(_mm_cvtsi128_si64(a) as u64, _mm_extract_epi32::<2>(a) as u32 as u64, bad, l1),
-            key(_mm_cvtsi128_si64(b) as u64, _mm_extract_epi32::<2>(b) as u32 as u64, bad >> 16, l2),
-        );
-    }
-    (pack_at(p1, l1), pack_at(p2, l2))
-}
-
-/// The IDs that do not pack (longer than 10 bytes, or a byte outside [0-9A-Z_a-z]): each gets a number, exact on
+/// The IDs that do not pack (longer than 9 bytes, or a byte that is NUL or not ASCII): each gets a number, exact on
 /// its bytes. Locked and slow; generated data never comes here.
 struct Interner {
     shards: Vec<Mutex<(HashMap<Box<[u8]>, u32, BuildHasherDefault<BytesHasher>>, Vec<Box<[u8]>>)>>,
@@ -249,15 +181,14 @@ impl Interner {
         }
     }
 
-    /// (`key` of the `l1` bytes at `p1`, `pack_at(p2, l2)`): a second ID that does not pack comes back as 0, for
-    /// the caller to intern if it turns out to be needed. 16 bytes must be readable at both.
+    /// `key` of the `len` (> 0) bytes at `p` (9 bytes must be readable).
     #[inline(always)]
-    unsafe fn key2_at(&self, p1: *const u8, l1: usize, p2: *const u8, l2: usize) -> (u64, u64) {
-        let (mut a, b) = pack2_at(p1, l1, p2, l2);
-        if a == 0 {
-            a = self.intern(std::slice::from_raw_parts(p1, l1));
+    unsafe fn key_at(&self, p: *const u8, len: usize) -> u64 {
+        let k = pack_at(p, len);
+        if k != 0 {
+            return k;
         }
-        (a, b)
+        self.intern(std::slice::from_raw_parts(p, len))
     }
 
     /// Appends the ID of `key` to `out`.
@@ -268,12 +199,12 @@ impl Interner {
             out.extend_from_slice(&g.1[key as u32 as usize]);
             return;
         }
-        for i in 0..10 {
-            let d = (key >> (54 - 6 * i)) & 63;
+        for i in 0..9 {
+            let d = (key >> (56 - 7 * i)) & 127;
             if d == 0 {
                 break;
             }
-            out.push(UNPACK[d as usize]);
+            out.push(d as u8);
         }
     }
 
@@ -292,7 +223,10 @@ impl Interner {
 
 // ---------------------------------------------------------------- memory
 
-/// `bytes` of zeroed anonymous memory, never freed; huge pages where the kernel offers them.
+/// Every region `map_anon` has handed out, as (address, bytes): what `release_regions` gives back.
+static REGIONS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// `bytes` of zeroed anonymous memory, never unmapped; huge pages where the kernel offers them.
 fn map_anon(bytes: usize) -> *mut u8 {
     let p = unsafe { libc::mmap(std::ptr::null_mut(), bytes, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
     if p == libc::MAP_FAILED {
@@ -302,6 +236,7 @@ fn map_anon(bytes: usize) -> *mut u8 {
     unsafe {
         libc::madvise(p, bytes, libc::MADV_HUGEPAGE); // a hint: fine if refused
     }
+    REGIONS.lock().unwrap_or_else(|_| die("region list poisoned")).push((p as usize, bytes));
     p as *mut u8
 }
 
@@ -314,14 +249,79 @@ fn filled<T: Clone>(n: usize, v: T) -> Vec<T> {
     x
 }
 
+/// Gives the pages of every `map_anon` region back to the kernel, on `threads` threads. Call when nothing reads
+/// them any more: they read as zeros afterwards. Whatever is left, the exit frees on its one thread, and the run
+/// is not over before that. With huge pages that is a few ms either way; where the kernel gave 4 KiB pages (THP
+/// off) it is 36 ms at the exit for 20M events, against 18 ms here.
+fn release_regions(threads: usize) {
+    const STEP: usize = 8 << 20;
+    // The output is written by now, so nothing here may end the run: a list that cannot be had, a thread that
+    // cannot start or a refused hint leaves memory to the exit, which only takes longer.
+    let Ok(mut list) = REGIONS.lock() else { return };
+    let regions = std::mem::take(&mut *list);
+    drop(list);
+    let mut pieces = Vec::new();
+    for (p, n) in regions {
+        let mut o = 0;
+        while o < n {
+            pieces.push((p + o, (n - o).min(STEP)));
+            o += STEP;
+        }
+    }
+    let next = AtomicUsize::new(0);
+    let work = || loop {
+        let i = next.fetch_add(1, Relaxed);
+        if i >= pieces.len() {
+            break;
+        }
+        // SAFETY: a piece of a live anonymous mapping that nothing reads any more
+        unsafe { libc::madvise(pieces[i].0 as *mut libc::c_void, pieces[i].1, libc::MADV_DONTNEED) };
+    };
+    std::thread::scope(|sc| {
+        for _ in 1..threads {
+            let _ = std::thread::Builder::new().spawn_scoped(sc, &work);
+        }
+        work();
+    });
+}
+
+/// Set at the start when the kernel never gives huge pages (transparent huge pages switched off).
+static SMALL_PAGES: AtomicBool = AtomicBool::new(false);
+
+/// With `SMALL_PAGES`: asks the kernel for the pages of the `bytes` at `p` (page aligned, in a `map_anon` region)
+/// in one call, where their first writes would take one page fault per 4 KiB. False when nothing was asked for:
+/// huge pages are on (a fault then brings 2 MiB at once, and this call on top was measured to cost, not save: 20M
+/// events, cold input, 0.68 -> 0.73 s), or the kernel does not know the call (before Linux 5.14).
+fn populate(p: usize, bytes: usize) -> bool {
+    if !SMALL_PAGES.load(Relaxed) {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    // SAFETY: a hint on a live anonymous mapping; its pages stay zero
+    unsafe {
+        libc::madvise(p as *mut libc::c_void, bytes, libc::MADV_POPULATE_WRITE) == 0
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (p, bytes);
+        false
+    }
+}
+
 /// A thread's bump allocator for stream blocks.
 struct Arena {
     cur: usize,
     end: usize,
+    ready: usize, // the chunk's pages below this address have been asked for (`populate`)
 }
 
 impl Arena {
     const CHUNK: usize = 32 << 20;
+    const STEP: usize = 2 << 20;
+
+    fn new() -> Arena {
+        Arena { cur: 0, end: 0, ready: 0 }
+    }
 
     #[inline]
     fn alloc(&mut self, bytes: usize) -> *mut u8 {
@@ -330,77 +330,41 @@ impl Arena {
             let n = bytes.max(Self::CHUNK);
             self.cur = map_anon(n) as usize;
             self.end = self.cur + n;
+            self.ready = self.cur;
         }
         let p = self.cur;
         self.cur += bytes;
+        while self.ready < self.cur {
+            let n = (self.end - self.ready).min(Self::STEP);
+            populate(self.ready, n);
+            self.ready += n;
+        }
         p as *mut u8
     }
 }
 
-/// Bytes a stream writes at a time: three cache lines, a whole number of records of every size here (12, 24).
-const GROUP: usize = 192;
-
-/// An append-only list of `T` in blocks of `per` records; a record never moves.
-///
-/// Records reach memory a group at a time: a thread appends to some 800 streams at once, and a record stored
-/// directly first reads its cache line from memory (read for ownership) and crowds the cache. A stream keeps the
-/// records of its current group (block offset a multiple of GROUP: blocks are 64-byte aligned, whole groups
-/// long) and writes the full group with non-temporal stores, three whole lines that are never read. A record's
-/// address is known when it is pushed; until its group is full or `finish` runs, its bytes are only in the stage.
-/// The caller fences (`sfence`) before others read, and calls `finish` once the pushing is over.
+/// An append-only list of `T` in blocks of `per` records; a record never moves. Records are pushed through the
+/// stream's `Hot` pointers (see `Shard`), and `cur` is up to date once they have been copied back.
 struct Stream<T> {
     cur: *mut T,
     end: *mut T,
     blocks: Vec<*mut T>,
-    n: usize,                    // records of the current group, in `stage`
-    stage: [u64; GROUP / 8],     // 8-byte aligned, as every record here
-    _t: std::marker::PhantomData<T>,
 }
 
 impl<T> Stream<T> {
-    const K: usize = GROUP / std::mem::size_of::<T>();
-
     fn new() -> Stream<T> {
-        const { assert!(GROUP % std::mem::size_of::<T>() == 0 && std::mem::align_of::<T>() <= 8 && !std::mem::needs_drop::<T>()) };
-        Stream { cur: std::ptr::null_mut(), end: std::ptr::null_mut(), blocks: Vec::new(), n: 0, stage: [0; GROUP / 8], _t: std::marker::PhantomData }
-    }
-
-    #[inline(always)]
-    fn push(&mut self, arena: &mut Arena, per: usize, v: T) -> *mut T {
-        if self.cur == self.end {
-            self.grow(arena, per);
-        }
-        let p = self.cur;
-        // SAFETY: cur < end, inside the block `grow` took from the arena; n < K slots of the stage
-        unsafe {
-            (self.stage.as_mut_ptr() as *mut T).add(self.n).write(v);
-            self.cur = p.add(1);
-        }
-        self.n += 1;
-        if self.n == Self::K {
-            // SAFETY: the group [cur - K, cur) is GROUP bytes at a 64-byte aligned address of the block
-            unsafe { stream_group((self.cur as *mut u8).sub(GROUP), self.stage.as_ptr() as *const u8) };
-            self.n = 0;
-        }
-        p
+        const { assert!(std::mem::align_of::<T>() <= 8 && !std::mem::needs_drop::<T>()) };
+        Stream { cur: std::ptr::null_mut(), end: std::ptr::null_mut(), blocks: Vec::new() }
     }
 
     #[cold]
     #[inline(never)]
     fn grow(&mut self, arena: &mut Arena, per: usize) {
-        debug_assert!(self.n == 0 && per % Self::K == 0);
         let p = arena.alloc(per * std::mem::size_of::<T>()) as *mut T;
         debug_assert!(p as usize % 64 == 0);
         self.blocks.push(p);
         self.cur = p;
         self.end = unsafe { p.add(per) };
-    }
-
-    /// Writes the records still staged (a group not yet full) to memory with plain stores.
-    fn finish(&mut self) {
-        // SAFETY: the n staged records belong at [cur - n, cur)
-        unsafe { std::ptr::copy_nonoverlapping(self.stage.as_ptr() as *const T, self.cur.sub(self.n), self.n) };
-        self.n = 0;
     }
 
     fn len(&self, per: usize) -> usize {
@@ -419,19 +383,38 @@ impl<T> Stream<T> {
     }
 }
 
-/// Copies a GROUP of bytes to `dst` (64-byte aligned) with non-temporal stores where available.
-#[inline(always)]
-unsafe fn stream_group(dst: *mut u8, src: *const u8) {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    {
-        use std::arch::x86_64::*;
-        for i in 0..GROUP / 32 {
-            _mm256_stream_si256(dst.add(32 * i) as *mut __m256i, _mm256_loadu_si256(src.add(32 * i) as *const __m256i));
-        }
-        return;
+/// The two pointers of a `Stream` that a push needs, kept apart from it: a parse thread feeds 768 streams at 2^8
+/// partitions and buckets and 1536 at 2^9, and with these in arrays of their own (12 or 24 KB, in L1) a push
+/// reads no line but the one it writes. Records go straight to their block with plain stores (staging them in
+/// the stream for non-temporal group writes measured even on Intel and costs instructions). Intel Cascade Lake,
+/// 2 cores x 2 threads, NCPU=8, against the staged streams: 60M 3.438 -> 3.409 s (median 3.455 -> 3.415), 40M
+/// 0.994, 20M 0.993-0.996 (medians even).
+struct Hot<T> {
+    cur: *mut T,
+    end: *mut T,
+}
+
+impl<T> Hot<T> {
+    fn new() -> Hot<T> {
+        Hot { cur: std::ptr::null_mut(), end: std::ptr::null_mut() }
     }
-    #[allow(unreachable_code)]
-    std::ptr::copy_nonoverlapping(src, dst, GROUP);
+
+    /// Appends `v` to `s`, whose next record goes to `cur`; `s.cur` is stale until the caller copies `cur` back.
+    #[inline(always)]
+    fn push(&mut self, s: &mut Stream<T>, arena: &mut Arena, per: usize, v: T) -> *mut T {
+        if self.cur == self.end {
+            s.grow(arena, per);
+            self.cur = s.cur;
+            self.end = s.end;
+        }
+        let p = self.cur;
+        // SAFETY: cur < end, inside the block `grow` took from the arena
+        unsafe {
+            p.write(v);
+            self.cur = p.add(1);
+        }
+        p
+    }
 }
 
 /// Orders this thread's non-temporal stores before its later stores.
@@ -457,11 +440,13 @@ fn prefetch<T>(p: *const T) {
 // ---------------------------------------------------------------- the ID table
 
 /// One user ID. `up` = 0: the ID is its own person (or the root of its link tree); else 1 + the slot above it.
+/// `px` = this slot's number xor its person's, once the links are flattened: 0 for a root and for every ID added
+/// later, so a lookup turns a slot into a person with one xor and no branch.
 #[repr(C)]
 struct Slot {
     key: AtomicU64,
     up: AtomicU32,
-    _pad: u32,
+    px: AtomicU32,
 }
 
 /// Every user ID seen in links, events and clicks: open addressing on the key, lock free, never resized.
@@ -483,34 +468,36 @@ impl IdTable {
 
     /// Writes to every 2 MiB of the table, on `threads` threads. A page first touched by a read (a lookup) maps
     /// the shared zero page, and the first write there then leaves the whole 2 MiB in 4 KiB pages: every later
-    /// lookup would miss the TLB. A write first gets a huge page (where the kernel gives them).
+    /// lookup would miss the TLB. A write first gets a huge page (where the kernel gives them). Where it gives
+    /// none, all the pages are asked for here instead: no lookup or insert then waits for a page fault.
     fn populate(&self, threads: usize) {
         const HUGE: usize = 2 << 20;
         let bytes = self.slots.len() * std::mem::size_of::<Slot>();
+        let base = self.slots.as_ptr() as usize;
         par(
             threads,
             bytes.div_ceil(HUGE),
             || (),
             |_, i| {
-                // a zero stored over a zero: the slot stays empty
-                self.slots[i * HUGE / std::mem::size_of::<Slot>()].up.store(0, Relaxed);
+                if !populate(base + i * HUGE, (bytes - i * HUGE).min(HUGE)) {
+                    // a zero stored over a zero: the slot stays empty
+                    self.slots[i * HUGE / std::mem::size_of::<Slot>()].up.store(0, Relaxed);
+                }
             },
         );
     }
 
+    /// Where the search for `key` starts: the first slot of a cache line (4 slots).
     #[inline(always)]
     fn home(&self, key: u64) -> usize {
-        (mix(key) >> (64 - self.bits)) as usize
+        (spread(key) >> (64 - self.bits)) as usize & !3
     }
 
     /// `home(key)`, with its cache line on the way: the lookup comes a few lines of input later.
     #[inline(always)]
     fn aim(&self, key: u64) -> u32 {
         let h = self.home(key);
-        // the line of the home slot and the line of the third slot after it (often the same one): a search that
-        // runs past the end of the home line, as more do the fuller the table is, still finds its slots in cache
         prefetch(unsafe { self.slots.as_ptr().add(h) });
-        prefetch(self.slots.as_ptr().wrapping_add(h + 3));
         h as u32
     }
 
@@ -520,9 +507,56 @@ impl IdTable {
         self.slot_from(self.home(key) as u32, key, ins)
     }
 
-    /// `slot` given `home(key)`.
+    /// `slot` given `home(key)`. A key sits in the first free slot from its home at the time it was added, and
+    /// slots never empty again, so it is in the four slots of its home line unless the line was full by then:
+    /// those four are compared without a branch between them (which of them holds the key is a coin toss to the
+    /// branch predictor), and only a key not among them takes the scan.
     #[inline(always)]
     fn slot_from(&self, home: u32, key: u64, ins: &mut usize) -> u32 {
+        // SAFETY: home is a multiple of 4 below the (power of two, >= 2^16) slot count
+        let s = unsafe { self.slots.as_ptr().add(home as usize) };
+        let eq = |j: usize| (unsafe { (*s.add(j)).key.load(Relaxed) } == key) as u32;
+        let m = eq(0) | eq(1) << 1 | eq(2) << 2 | eq(3) << 3;
+        if m != 0 {
+            return home + m.trailing_zeros();
+        }
+        self.slot_scan(home, key, ins)
+    }
+
+    /// `slot_from` that does not leave the line at `home`: None when the line is full of other keys, so the key
+    /// is (or will be added) further on. The caller asks for the next line (`next_line`) and comes back when
+    /// it is in the cache, instead of waiting for it here.
+    ///
+    /// None is exact: a slot never changes once it holds a key, so four keys read here that are not `key` are
+    /// the line's four keys for good. A slot read as empty may have been filled since (by another thread, even
+    /// with this very key), so any empty one sends the lookup through `slot_scan`, which takes each slot in turn.
+    #[inline(always)]
+    fn slot_in_line(&self, home: u32, key: u64, ins: &mut usize) -> Option<u32> {
+        // SAFETY: as in `slot_from`
+        let s = unsafe { self.slots.as_ptr().add(home as usize) };
+        let k = [0, 1, 2, 3].map(|j| unsafe { (*s.add(j)).key.load(Relaxed) });
+        let m = (k[0] == key) as u32 | ((k[1] == key) as u32) << 1 | ((k[2] == key) as u32) << 2 | ((k[3] == key) as u32) << 3;
+        if m != 0 {
+            return Some(home + m.trailing_zeros());
+        }
+        if (k[0] != 0) & (k[1] != 0) & (k[2] != 0) & (k[3] != 0) {
+            return None;
+        }
+        Some(self.slot_scan(home, key, ins))
+    }
+
+    /// The line after the one at `home`, with its cache line on the way.
+    #[inline(always)]
+    fn next_line(&self, home: u32) -> u32 {
+        let h = (home as usize + 4) & (self.slots.len() - 1);
+        prefetch(unsafe { self.slots.as_ptr().add(h) });
+        h as u32
+    }
+
+    /// `slot_from` for a key that is not in its home line (yet): linear probing from `home`, adding the key in the
+    /// first free slot.
+    #[inline(never)]
+    fn slot_scan(&self, home: u32, key: u64, ins: &mut usize) -> u32 {
         let mask = self.slots.len() - 1;
         let mut i = home as usize;
         loop {
@@ -561,10 +595,7 @@ impl IdTable {
     /// The person of the ID in `slot`, once the links are flattened.
     #[inline(always)]
     fn person(&self, slot: u32) -> u32 {
-        match unsafe { self.slots.get_unchecked(slot as usize) }.up.load(Relaxed) {
-            0 => slot,
-            u => u - 1,
-        }
+        slot ^ unsafe { self.slots.get_unchecked(slot as usize) }.px.load(Relaxed)
     }
 
     /// The root above `x`, halving the path on the way.
@@ -772,6 +803,16 @@ unsafe fn masks64(p: *const u8) -> [u64; 3] {
         }
         r
     }
+}
+
+/// `masks64` for the 32 bytes at `p`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn masks32(p: *const u8) -> [u64; 3] {
+    use std::arch::x86_64::*;
+    let a = _mm256_loadu_si256(p as *const __m256i);
+    let m = |c: u8| _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, _mm256_set1_epi8(c as i8))) as u32 as u64;
+    [m(b','), m(b'"'), m(b'\n')]
 }
 
 /// Calls `f` with the N unquoted fields of every well-formed line that starts in [start, end)
@@ -1049,6 +1090,16 @@ unsafe fn ts_at(p: *const u8, len: usize) -> Option<i64> {
     if len == 0 || len > 16 {
         return parse_ts(std::slice::from_raw_parts(p, len));
     }
+    if len == 13 {
+        // F3 of today's length: its first five digits behind three zero bytes, and its last eight
+        const Z: u64 = u64::from_le_bytes([b'0'; 8]);
+        let a = ((p as *const u64).read_unaligned() << 24) ^ (Z << 24);
+        let b = (p.add(5) as *const u64).read_unaligned() ^ Z;
+        if (a.wrapping_add(0x7676_7676_7676_7676) | a | b.wrapping_add(0x7676_7676_7676_7676) | b) & HI != 0 {
+            return None;
+        }
+        return Some((swar8(a) * 100_000_000 + swar8(b)) as i64);
+    }
     // F3 of 1..=16 bytes: right-align into 16 bytes behind leading '0's, check all digits, convert
     let sh = 8 * (16 - len) as u32;
     let zeros = u128::from_le_bytes([b'0'; 16]);
@@ -1094,12 +1145,16 @@ unsafe fn ts_memo(p: *const u8, len: usize, days: &mut [Day; 32]) -> Option<i64>
     if (x.wrapping_add(ADD) | x) & HI != 0 {
         return None;
     }
-    let pb = x * 10 + (x >> 8);
-    let (h, mi, sec) = (pb & 0xFF, (pb >> 24) & 0xFF, (pb >> 48) & 0xFF);
-    if (h > 23) | (mi > 59) | (sec > 59) {
+    // hours in byte 0, minutes in byte 3, seconds in byte 6, each 0..=99
+    let pb = (x * 10 + (x >> 8)) & 0x00FF_0000_FF00_00FF;
+    // adding 127 - 23 (127 - 59) carries an hour over 23 (a minute or second over 59) into its byte's high bit
+    if pb.wrapping_add(0x0044_0000_4400_0068) & 0x0080_0000_8000_0080 != 0 {
         return None;
     }
-    let t = day.ms + (h * 3_600_000 + mi * 60_000 + sec * 1000) as i64;
+    // one multiply: h * 3600 + mi * 60 + sec (17 bits) lands at bit 48 of the product; the other terms end below
+    // bit 36 or start at bit 72
+    let secs = ((pb as u128 * ((3600u128 << 48) | (60 << 24) | 1)) >> 48) as u64 & 0x1_FFFF;
+    let t = day.ms + (secs * 1000) as i64;
     if f1 {
         return Some(t);
     }
@@ -1251,148 +1306,134 @@ fn read_span(f: &InFile, s: usize, e: usize, buf: &mut Vec<u8>) -> (usize, usize
     (len, s - bs, e - bs)
 }
 
-/// Calls `fast(st, line, e, [c0, c1, q0, q1])` for every line that starts in [start, end) of the `len` bytes at
-/// `buf` and has its `\n` in its first 128 bytes: line[e], and the comma bits c0 (bytes 0..64) and c1 (64..128)
-/// and quote bits q0, q1 of line[..e]. A longer line goes whole to `slow`. The header line is skipped. `buf` must
-/// be readable for 144 bytes past `len`, and buf[len] must be `\n`.
+/// `x` without its lowest set bit.
 #[inline(always)]
-unsafe fn scan_lines<S>(
-    buf: *const u8,
-    start: usize,
-    end: usize,
-    len: usize,
-    st: &mut S,
-    fast: impl Fn(&mut S, *const u8, usize, [u64; 4]),
-    slow: impl Fn(&mut S, Bytes),
-) {
+fn drop_low(x: u64) -> u64 {
+    x & x.wrapping_sub(1)
+}
+
+/// The fields that end at the boundaries `b` (commas, or the line's `\n`) of a 64-byte window that starts where a
+/// field starts, given the window's quotes `q` below its last boundary: (where each field's value starts, where it
+/// ends, nonzero when a quote is out of place). Field i's value runs from the i-th set bit of the first word to the
+/// i-th set bit of the second, quotes left out; the first word has one more bit, past the last boundary.
+///
+/// Well quoted <=> every quote sits at a field's first byte (`s`) or right before its boundary (`z`), none is both
+/// (a lone `"`), and per field a first-byte quote (`x`) comes with a last-byte quote (`y`, moved onto the boundary):
+/// then `y - x` borrows across exactly the quoted fields' bytes and clears every boundary, while a field with only
+/// one of the two leaves a bit on the boundary that ends it (or the lowest such field does).
+#[inline(always)]
+fn window(b: u64, q: u64) -> (u64, u64, u64) {
+    let s = (b << 1) | 1;
+    let z = b >> 1;
+    let x = q & s;
+    let y = (q << 1) & b;
+    let bad = (q & !(s | z)) | (x & z) | (y.wrapping_sub(x) & b);
+    ((s ^ x) | (x << 1), (b & !y) | (y >> 1), bad)
+}
+
+/// The fields of a window still to come, in order (`window`).
+#[derive(Clone, Copy)]
+struct Cut {
+    s: u64,
+    e: u64,
+}
+
+impl Cut {
+    /// The next field as (start, length), quotes removed.
+    #[inline(always)]
+    fn next(&mut self) -> (usize, usize) {
+        let (s, e) = (self.s.trailing_zeros() as usize, self.e.trailing_zeros() as usize);
+        (self.s, self.e) = (drop_low(self.s), drop_low(self.e));
+        (s, e - s)
+    }
+}
+
+/// `split::<7>` of the event line at `line` (136 bytes must be readable): its first three fields from `line`, the
+/// other four from `line + o`, o, and the line's length with its `\n`. None sends the line to `split`: it is
+/// malformed, or it does not have its first three fields in its first 64 bytes and the other four in the 64 bytes
+/// from the fourth's start.
+///
+/// Two windows of 64 bytes, so every mask is one word: nearly every line has its third comma by byte 51, and then
+/// 55 bytes or fewer to its end.
+#[inline(always)]
+unsafe fn split_event(line: *const u8) -> Option<(Cut, Cut, usize, usize)> {
+    let [ca, qa, na] = masks64(line);
+    let ba = ca | na;
+    let b2 = drop_low(drop_low(ba));
+    if b2 == 0 {
+        return None;
+    }
+    let ma = b2 ^ b2.wrapping_sub(1); // through the third boundary
+    let (sa, ea, bad_a) = window(ba & ma, qa & ma);
+    // the second window starts after the third comma: its masks are those of the line's bytes 64.. moved down
+    // (taken at a fixed place, so they do not wait for the comma to be found). Nearly every line ends in its first
+    // 96 bytes: the last 32 of the 128 are looked at only when it does not
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    let [c1, q1, n1] = {
+        let [mut c1, mut q1, mut n1] = masks32(line.add(64));
+        if na | n1 == 0 {
+            let [c, q, n] = masks32(line.add(96));
+            (c1, q1, n1) = (c1 | c << 32, q1 | q << 32, n1 | n << 32);
+        }
+        [c1, q1, n1]
+    };
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    let [c1, q1, n1] = masks64(line.add(64));
+    let k2 = b2.trailing_zeros();
+    let o = k2 as usize + 1;
+    let down = |m0: u64, m1: u64| ((m0 >> 1) >> k2) | (m1 << (63 - k2));
+    let (cb, qb, nb) = (down(ca, c1), down(qa, q1), down(na, n1));
+    let bb = cb | nb;
+    let b3 = drop_low(drop_low(drop_low(bb)));
+    if b3 == 0 {
+        return None;
+    }
+    let mb = b3 ^ b3.wrapping_sub(1); // through the fourth boundary
+    let (sb, eb, bad_b) = window(bb & mb, qb & mb);
+    // the first three boundaries are commas; of the next four only the last is a newline
+    if (ba & ma & na) | bad_a | ((nb & mb) ^ (b3 & b3.wrapping_neg())) | bad_b != 0 {
+        return None;
+    }
+    Some((Cut { s: sa, e: ea }, Cut { s: sb, e: eb }, o, o + b3.trailing_zeros() as usize + 1))
+}
+
+/// `split::<4>` of the click line at `line` (72 bytes must be readable), as `split_event`: its fields, and its
+/// length with its `\n`. None unless the whole line is in its first 64 bytes.
+#[inline(always)]
+unsafe fn split_click(line: *const u8) -> Option<(Cut, usize)> {
+    let [c, q, n] = masks64(line);
+    let b = c | n;
+    let b3 = drop_low(drop_low(drop_low(b)));
+    if b3 == 0 {
+        return None;
+    }
+    let m = b3 ^ b3.wrapping_sub(1);
+    let (s, e, bad) = window(b & m, q & m);
+    if ((n & m) ^ (b3 & b3.wrapping_neg())) | bad != 0 {
+        return None;
+    }
+    Some((Cut { s, e }, b3.trailing_zeros() as usize + 1))
+}
+
+/// Calls `fast(st, line)` for every line that starts in [start, end) of the `len` bytes at `buf`; it returns the
+/// line's length with its `\n`, or 0 for a line it leaves to `slow`, which gets the line whole. The header line is
+/// skipped. `buf` must be readable for 144 bytes past `len`, and buf[len] must be `\n`.
+#[inline(always)]
+unsafe fn scan_lines<S>(buf: *const u8, start: usize, end: usize, len: usize, st: &mut S, fast: impl Fn(&mut S, *const u8) -> usize, slow: impl Fn(&mut S, Bytes)) {
     let file = std::slice::from_raw_parts(buf, len);
     let first = start.saturating_sub(1);
     let Some(nl) = memchr::memchr(b'\n', &file[first..]) else { return };
     let mut p = first + nl + 1;
     while p < end && p < len {
-        let line = buf.add(p);
-        let [c0, q0, n0] = masks64(line);
-        // x & -x is the lowest bit of x: the newline; less 1, the bits below it: the line
-        let (e, m) = if n0 != 0 {
-            let lm = (n0 & n0.wrapping_neg()) - 1;
-            (n0.trailing_zeros() as usize, [c0 & lm, 0, q0 & lm, 0])
+        let n = fast(st, buf.add(p));
+        if n != 0 {
+            p += n;
         } else {
-            let [c1, q1, n1] = masks64(line.add(64));
-            if n1 == 0 {
-                let e = memchr::memchr(b'\n', &file[p..]).map_or(len, |i| p + i);
-                slow(st, std::mem::transmute::<&[u8], Bytes>(&file[p..e]));
-                p = e + 1;
-                continue;
-            }
-            let lm = (n1 & n1.wrapping_neg()) - 1;
-            (64 + n1.trailing_zeros() as usize, [c0, c1 & lm, q0, q1 & lm])
-        };
-        fast(st, line, e, m);
-        p += e + 1;
-    }
-}
-
-/// The bits of `x` at the set bits of `mask`, packed into the low bits.
-#[inline(always)]
-fn pext(x: u64, mask: u64) -> u64 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
-    unsafe {
-        return std::arch::x86_64::_pext_u64(x, mask);
-    }
-    #[allow(unreachable_code)]
-    {
-        let (mut m, mut out, mut k) = (mask, 0u64, 0);
-        while m != 0 {
-            out |= ((x >> m.trailing_zeros()) & 1) << k;
-            k += 1;
-            m &= m - 1;
+            let e = memchr::memchr(b'\n', &file[p..]).map_or(len, |i| p + i);
+            slow(st, std::mem::transmute::<&[u8], Bytes>(&file[p..e]));
+            p = e + 1;
         }
-        out
     }
-}
-
-/// The low bits of `x` spread onto the set bits of `mask`.
-#[inline(always)]
-fn pdep(x: u64, mask: u64) -> u64 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
-    unsafe {
-        return std::arch::x86_64::_pdep_u64(x, mask);
-    }
-    #[allow(unreachable_code)]
-    {
-        let (mut m, mut out, mut k) = (mask, 0u64, 0);
-        while m != 0 {
-            out |= ((x >> k) & 1) << m.trailing_zeros();
-            k += 1;
-            m &= m - 1;
-        }
-        out
-    }
-}
-
-/// The fields of a line of under 128 bytes: byte i of `at` is the offset of field i and byte i of `len` its
-/// length, quotes removed.
-#[derive(Clone, Copy)]
-struct Fields {
-    at: u64,
-    len: u64,
-}
-
-impl Fields {
-    #[inline(always)]
-    fn at(self, i: usize) -> usize {
-        (self.at >> (8 * i)) as u8 as usize
-    }
-    #[inline(always)]
-    fn len(self, i: usize) -> usize {
-        (self.len >> (8 * i)) as u8 as usize
-    }
-}
-
-/// The N (<= 8) fields of the line of `e` (< 128) bytes, given its comma and quote bits (see `scan_lines`); None
-/// when the line is malformed (`split::<N>` says the same).
-#[inline(always)]
-fn fast_split<const N: usize>(e: usize, [c0, c1, q0, q1]: [u64; 4]) -> Option<Fields> {
-    const { assert!(N >= 1 && N <= 8) };
-    let n0 = c0.count_ones();
-    if (n0 + c1.count_ones()) as usize != N - 1 {
-        return None;
-    }
-    // Well quoted <=> every quote sits at a field's first or last byte (s, ends), none is both (a lone `"`), and
-    // per field a first-byte quote (x) comes with a last-byte quote (y, moved onto the boundary after it). Then
-    // y - x borrows across exactly the quoted fields' bytes, so a field with only one of the two leaves a bit on
-    // the boundary that ends it (or the first such field does). All of it on 128 bits held as two words.
-    let (nl0, nl1) = if e < 64 { (1u64 << e, 0) } else { (0, 1u64 << (e - 64)) };
-    let (b0, b1) = (c0 | nl0, c1 | nl1);
-    let (s0, s1) = ((b0 << 1) | 1, (b1 << 1) | (b0 >> 63));
-    let (ends0, ends1) = ((b0 >> 1) | (b1 << 63), b1 >> 1);
-    let (x0, x1) = (q0 & s0, q1 & s1);
-    let (y0, y1) = ((q0 << 1) & b0, ((q1 << 1) | (q0 >> 63)) & b1);
-    let (d0, borrow) = y0.overflowing_sub(x0);
-    let d1 = y1.wrapping_sub(x1).wrapping_sub(borrow as u64);
-    if (q0 & !(s0 | ends0)) | (x0 & ends0) | (d0 & b0) | (q1 & !(s1 | ends1)) | (x1 & ends1) | (d1 & b1) != 0 {
-        return None;
-    }
-    // The comma offsets, one a byte: N - 1 slots from each word (a slot past a word's last comma holds 64 or
-    // 128), the second word's moved up behind the first word's n0. Byte N - 1 is the newline: the field ends.
-    let (mut a, mut b) = (c0, c1);
-    let (mut p0, mut p1) = (0u64, 0u64);
-    for j in 0..N - 1 {
-        p0 |= (a.trailing_zeros() as u64) << (8 * j);
-        a &= a.wrapping_sub(1);
-        p1 |= (64 + b.trailing_zeros() as u64) << (8 * j);
-        b &= b.wrapping_sub(1);
-    }
-    let commas = ((p0 & ((1u64 << (8 * n0)) - 1)) | (p1 << (8 * n0))) & ((1u64 << (8 * (N - 1))) - 1);
-    let ends = commas | (e as u64) << (8 * (N - 1));
-    // a field starts after the comma before it; the first at 0
-    const ONES: u64 = 0x0101_0101_0101_0101;
-    let starts = (ends << 8).wrapping_add(ONES << 8);
-    // field i is quoted when the i-th field start holds a quote: 1 in byte i of `quoted`
-    let quoted = pdep(pext(x0, s0) | pext(x1, s1) << s0.count_ones(), ONES);
-    // no byte borrows from the one above: a quoted field has its two quotes inside it
-    let at = starts.wrapping_add(quoted);
-    Some(Fields { at, len: ends.wrapping_sub(at).wrapping_sub(quoted) })
 }
 
 /// (user + sys CPU seconds, instructions retired) of this process so far; instructions only on macOS
@@ -1492,15 +1533,31 @@ struct LRec {
 #[derive(Clone, Copy)]
 struct CRec {
     cid: u64,
-    person: u32,
-    ts: u32, // ms after `Ctx::base`
-    camp: u32,
-    _pad: u32,
+    w: u64, // ts (ms after `Ctx::base`) | campaign << 32 | the person's number within its partition << 48
+}
+
+impl CRec {
+    #[inline(always)]
+    fn new(cid: u64, local: u32, ts: u32, camp: u32) -> CRec {
+        CRec { cid, w: ts as u64 | (camp as u64) << 32 | (local as u64) << 48 }
+    }
+    #[inline(always)]
+    fn ts(self) -> u32 {
+        self.w as u32
+    }
+    #[inline(always)]
+    fn camp(self) -> u32 {
+        (self.w >> 32) as u16 as u32
+    }
+    #[inline(always)]
+    fn local(self) -> u32 {
+        (self.w >> 48) as u32
+    }
 }
 
 const EV_BLOCK: usize = 512;
 const LG_BLOCK: usize = 256;
-const CK_BLOCK: usize = 128;
+const CK_BLOCK: usize = 192; // records: a whole number of 192-byte groups of 16-byte CRecs (3072 bytes, as before)
 
 /// A valid event or click whose user ID is on its way from memory (`IdTable::aim`).
 #[derive(Clone, Copy, Default)]
@@ -1519,6 +1576,12 @@ const RING: usize = 16;
 /// One parse thread's output.
 struct Shard {
     arena: Arena,
+    // where each stream's next record goes, and its block's end: what a push reads, in a few KB that stay in the
+    // core's L1 (the streams themselves, with their block lists, are only touched when a block fills up). At 2^9
+    // partitions and buckets a thread feeds 1536 streams.
+    evh: Vec<Hot<ERec>>,
+    ckh: Vec<Hot<CRec>>,
+    lgh: Vec<Hot<LRec>>,
     ev: Vec<Stream<ERec>>,
     ck: Vec<Stream<CRec>>,
     lg: Vec<Stream<LRec>>,
@@ -1557,13 +1620,16 @@ struct Ctx {
     ids: IdTable,
     names: Interner,
     pshift: u32, // person >> pshift = person partition
-    qshift: u32, // mix(event key) >> qshift = event-key bucket
+    qshift: u32, // spread(event key) >> qshift = event-key bucket
 }
 
 impl Shard {
     fn new(parts: usize, buckets: usize) -> Shard {
         Shard {
-            arena: Arena { cur: 0, end: 0 },
+            arena: Arena::new(),
+            evh: (0..parts).map(|_| Hot::new()).collect(),
+            ckh: (0..parts).map(|_| Hot::new()).collect(),
+            lgh: (0..buckets).map(|_| Hot::new()).collect(),
             ev: (0..parts).map(|_| Stream::new()).collect(),
             ck: (0..parts).map(|_| Stream::new()).collect(),
             lg: (0..buckets).map(|_| Stream::new()).collect(),
@@ -1573,6 +1639,13 @@ impl Shard {
             head: 0,
             days: [NO_DAY; 32],
         }
+    }
+
+    /// Hands each stream its fill level, once the pushing is over.
+    fn settle(&mut self) {
+        self.evh.iter().zip(&mut self.ev).for_each(|(h, s)| s.cur = h.cur);
+        self.ckh.iter().zip(&mut self.ck).for_each(|(h, s)| s.cur = h.cur);
+        self.lgh.iter().zip(&mut self.lg).for_each(|(h, s)| s.cur = h.cur);
     }
 
     /// Queues `p`; returns the one queued RING entries ago, whose slot is in the cache by now.
@@ -1589,34 +1662,51 @@ impl Shard {
     fn flush(&mut self, cx: &Ctx, events: bool) {
         for k in self.head.saturating_sub(RING)..self.head {
             let p = self.ring[k & (RING - 1)];
+            let person = cx.ids.person(cx.ids.slot_from(p.home, p.ukey, &mut self.ins));
             if events {
-                self.finish_event(cx, p);
+                self.put_event(cx, p, person);
             } else {
-                self.finish_click(cx, p);
+                self.put_click(cx, p, person);
             }
         }
         self.head = 0;
     }
 
+    /// The person of the queued `p`, whose line of the ID table is in the cache by now. An ID that is not in that
+    /// line goes back in the queue to wait for the next line, and the entry that leaves the queue for it is looked
+    /// up instead; None when nothing left the queue.
+    #[inline(always)]
+    fn resolve(&mut self, cx: &Ctx, mut p: Pend) -> Option<(Pend, u32)> {
+        loop {
+            if let Some(slot) = cx.ids.slot_in_line(p.home, p.ukey, &mut self.ins) {
+                return Some((p, cx.ids.person(slot)));
+            }
+            p.home = cx.ids.next_line(p.home);
+            p = self.queue(p)?;
+        }
+    }
+
     /// Any parsed event: its dedup record. `loc` = 0 for an invalid or late one.
     #[inline(always)]
     fn log(&mut self, cx: &Ctx, ekey: u64, ingest: i64, loc: u64) {
-        let q = (mix(ekey) >> cx.qshift) as usize;
-        self.lg[q].push(&mut self.arena, LG_BLOCK, LRec { key: ekey, ingest, loc });
+        let q = (spread(ekey) >> cx.qshift) as usize;
+        self.lgh[q].push(&mut self.lg[q], &mut self.arena, LG_BLOCK, LRec { key: ekey, ingest, loc });
     }
 
     /// A valid, non-late event: into its person's partition, plus its dedup record, once its user ID is at hand.
     #[inline(always)]
     fn keep(&mut self, cx: &Ctx, ekey: u64, ingest: i64, ukey: u64, ts: i64, pay: u32) {
         if let Some(p) = self.queue(Pend { a: ekey, b: ingest, ukey, home: cx.ids.aim(ukey), ts: (ts - cx.base) as u32, x: pay }) {
-            self.finish_event(cx, p);
+            if let Some((p, person)) = self.resolve(cx, p) {
+                self.put_event(cx, p, person);
+            }
         }
     }
 
     #[inline(always)]
-    fn finish_event(&mut self, cx: &Ctx, p: Pend) {
-        let person = cx.ids.person(cx.ids.slot_from(p.home, p.ukey, &mut self.ins));
-        let rec = self.ev[(person >> cx.pshift) as usize].push(&mut self.arena, EV_BLOCK, ERec { person, ts: p.ts, pay: p.x });
+    fn put_event(&mut self, cx: &Ctx, p: Pend, person: u32) {
+        let part = (person >> cx.pshift) as usize;
+        let rec = self.evh[part].push(&mut self.ev[part], &mut self.arena, EV_BLOCK, ERec { person, ts: p.ts, pay: p.x });
         self.log(cx, p.a, p.b, rec as u64);
     }
 
@@ -1624,14 +1714,16 @@ impl Shard {
     #[inline(always)]
     fn click(&mut self, cx: &Ctx, cid: u64, ukey: u64, ts: i64, camp: u16) {
         if let Some(p) = self.queue(Pend { a: cid, b: 0, ukey, home: cx.ids.aim(ukey), ts: (ts - cx.base) as u32, x: camp as u32 }) {
-            self.finish_click(cx, p);
+            if let Some((p, person)) = self.resolve(cx, p) {
+                self.put_click(cx, p, person);
+            }
         }
     }
 
     #[inline(always)]
-    fn finish_click(&mut self, cx: &Ctx, p: Pend) {
-        let person = cx.ids.person(cx.ids.slot_from(p.home, p.ukey, &mut self.ins));
-        self.ck[(person >> cx.pshift) as usize].push(&mut self.arena, CK_BLOCK, CRec { cid: p.a, person, ts: p.ts, camp: p.x, _pad: 0 });
+    fn put_click(&mut self, cx: &Ctx, p: Pend, person: u32) {
+        let part = (person >> cx.pshift) as usize;
+        self.ckh[part].push(&mut self.ck[part], &mut self.arena, CK_BLOCK, CRec::new(p.a, person & ((1 << cx.pshift) - 1), p.ts, p.x));
     }
 }
 
@@ -1663,6 +1755,11 @@ fn main() {
         usage0.set((c, ins));
     };
 
+    // no huge pages from this kernel: memory is asked for in bulk (`populate`). An unreadable setting counts as on.
+    if std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled").is_ok_and(|s| s.contains("[never]")) {
+        SMALL_PAGES.store(true, Relaxed);
+    }
+
     // manifest
     let manifest = std::fs::read_to_string(data.join("manifest.json")).unwrap_or_else(|e| die(&format!("manifest.json: {e}")));
     let ws = manifest_ts(&manifest, "window_start");
@@ -1688,9 +1785,18 @@ fn main() {
     // about 90,000 events per person partition and per event-key bucket: more of them slow the parse (one open
     // block each per thread), fewer leave the later phases with work that no longer fits a core's cache
     let ev_est = ev_bytes / 72;
-    let pbits = (env_num("SESS_PBITS").map(|v| v as u32).unwrap_or_else(|| log2_near(ev_est / 90_000))).clamp(4, 12.min(id_bits - 4));
-    let qbits = (env_num("SESS_QBITS").map(|v| v as u32).unwrap_or_else(|| log2_near(ev_est / 90_000))).clamp(4, 12);
-    let chunk = env_num("SESS_CHUNK").filter(|&c| c >= 4096).unwrap_or(512 << 10);
+    // and no more than 2^9 of each: past that a thread's open streams (3 per partition pair) outgrow its half of an
+    // L2 shared by two hyperthreads. Intel Cascade Lake, 2 cores x 2 threads, 40M events: 2^10 + 2^10 +2.3% wall
+    // against 2^9 + 2^9, while 2^8 + 2^8 is even with it (164K events a partition); box, 75M events, 8 threads
+    // on 4 CPUs: 2^10 3.03 s, 2^9 2.76 s. Only inputs over ~69M events change. The partitions' floor (a click
+    // keeps its person's number in the partition in 16 bits) stays above the cap.
+    let pbits = (env_num("SESS_PBITS").map(|v| v as u32).unwrap_or_else(|| log2_near(ev_est / 90_000).min(9))).clamp(4, 12.min(id_bits - 4)).max(id_bits.saturating_sub(16));
+    let qbits = (env_num("SESS_QBITS").map(|v| v as u32).unwrap_or_else(|| log2_near(ev_est / 90_000).min(9))).clamp(4, 12);
+    // 128 KiB a read: the copy from the page cache passes the piece through the core's cache twice (as source and
+    // as copy), and a larger piece pushes the thread's open stream groups out of it (L2 is 1 MiB, and on the scorer
+    // two threads share it). tmpfs, 20M, 21 runs each, parse CPU: 512 KiB 1.66 s, 128 KiB 1.62 s, 64 KiB 1.60 s,
+    // 32 KiB 1.58 s; wall medians 0.340, 0.336, 0.333, 0.354 s
+    let chunk = env_num("SESS_CHUNK").filter(|&c| c >= 4096).unwrap_or(128 << 10);
 
     // the parse queue: events first, then clicks
     let mut work = Vec::new();
@@ -1760,9 +1866,7 @@ fn main() {
     );
     // the records of groups not yet full, written by this thread (each parse thread fenced its own before the join)
     for s in &mut shards {
-        s.ev.iter_mut().for_each(Stream::finish);
-        s.ck.iter_mut().for_each(Stream::finish);
-        s.lg.iter_mut().for_each(Stream::finish);
+        s.settle();
     }
     let n_ev: usize = shards.iter().flat_map(|s| s.ev.iter()).map(|s| s.len(EV_BLOCK)).sum();
     let n_ck: usize = shards.iter().flat_map(|s| s.ck.iter()).map(|s| s.len(CK_BLOCK)).sum();
@@ -1845,6 +1949,9 @@ fn main() {
         (camp_rows, results)
     });
     lap(&format!("sessions aggregated, {} user rows and {} campaign rows written", n_rows.load(Relaxed), camp_rows.len()));
+    // every worker is joined: the records and the ID table have been read for the last time, so their memory goes back
+    // to the kernel on all threads (arena c4; where THP is off the exit would free 4 KiB pages on one thread)
+    release_regions(threads);
     if std::env::var_os("SESS_DEBUG").is_some() {
         if let Ok(t) = std::fs::read_to_string("/proc/self/smaps_rollup") {
             for l in t.lines().filter(|l| l.starts_with("Rss") || l.starts_with("AnonHuge") || l.starts_with("Anonymous")) {
@@ -1861,20 +1968,32 @@ fn main() {
 /// key, any other ID in a byte-string map.
 struct IdMap {
     slots: Vec<(u64, u16)>, // key 0 = empty
+    shift: u32,             // spread(key) >> shift = where the search for a key starts
     other: BytesMap<u16>,
+    // the IDs of up to 7 bytes by their raw bytes (`short_key`), for `get_short`; empty unless `with_short`
+    rkeys: Vec<u64>, // 0 = empty
+    rvals: Vec<u16>,
+    rshift: u32,
+}
+
+/// An ID of `len` < 8 bytes read as the `len` low bytes of `raw`, with `len + 1` above them: never 0, and the
+/// same for two IDs only when their bytes are.
+#[inline(always)]
+fn short_key(raw: u64, len: usize) -> u64 {
+    (raw & ((1u64 << (8 * len)) - 1)) | (len as u64 + 1) << 56
 }
 
 impl IdMap {
     fn new(ids: &[(Bytes, u16)]) -> IdMap {
         let cap = (ids.len() * 2).next_power_of_two().max(16);
-        let mut m = IdMap { slots: filled(cap, (0, 0)), other: BytesMap::default() };
+        let mut m = IdMap { slots: filled(cap, (0, 0)), shift: 64 - cap.trailing_zeros(), other: BytesMap::default(), rkeys: Vec::new(), rvals: Vec::new(), rshift: 0 };
         for &(id, v) in ids {
             match pack(id) {
                 0 => {
                     m.other.insert(id, v);
                 }
                 k => {
-                    let mut i = mix(k) as usize & (cap - 1);
+                    let mut i = (spread(k) >> m.shift) as usize;
                     while m.slots[i].0 != 0 {
                         i = (i + 1) & (cap - 1);
                     }
@@ -1885,12 +2004,56 @@ impl IdMap {
         m
     }
 
+    /// Adds the table `get_short` reads: the IDs of 1 to 7 bytes by their raw bytes, in a table of no more than a
+    /// fourth full (a lookup of an ID not in it ends at the first empty slot, nearly always the first).
+    fn with_short(mut self, ids: &[(Bytes, u16)]) -> IdMap {
+        let cap = (ids.len() * 4).next_power_of_two().max(16);
+        self.rkeys = vec![0; cap];
+        self.rvals = vec![0; cap];
+        self.rshift = 64 - cap.trailing_zeros();
+        for &(id, v) in ids {
+            if id.len() >= 1 && id.len() < 8 {
+                let mut raw = [0u8; 8];
+                raw[..id.len()].copy_from_slice(id);
+                let k = short_key(u64::from_le_bytes(raw), id.len());
+                let mut i = (spread(k) >> self.rshift) as usize;
+                while self.rkeys[i] != 0 {
+                    i = (i + 1) & (cap - 1);
+                }
+                self.rkeys[i] = k;
+                self.rvals[i] = v;
+            }
+        }
+        self
+    }
+
+    /// `get_at` for a map made `with_short`.
+    #[inline(always)]
+    unsafe fn get_short(&self, p: *const u8, len: usize) -> Option<u16> {
+        if len >= 8 {
+            return self.get_at(p, len);
+        }
+        let k = short_key((p as *const u64).read_unaligned(), len);
+        let mask = self.rkeys.len() - 1;
+        let mut i = (spread(k) >> self.rshift) as usize;
+        loop {
+            let key = *self.rkeys.get_unchecked(i);
+            if key == k {
+                return Some(*self.rvals.get_unchecked(i));
+            }
+            if key == 0 {
+                return None;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
     #[inline(always)]
     fn packed(&self, k: u64) -> Option<u16> {
         let mask = self.slots.len() - 1;
-        let mut i = mix(k) as usize & mask;
+        let mut i = (spread(k) >> self.shift) as usize;
         loop {
-            // SAFETY: i <= mask
+            // SAFETY: i <= mask (the shift leaves as many bits as the mask has)
             let (key, v) = unsafe { *self.slots.get_unchecked(i) };
             if key == k {
                 return Some(v);
@@ -1977,7 +2140,7 @@ fn small_tables(data: &Path) -> Small {
         camp_ids.push(c);
         camp_channel.push(ch);
     }
-    Small { products: IdMap::new(&products), campaigns: IdMap::new(&campaigns), cat_names, cat_rank, unknown_cat, camp_ids, camp_channel }
+    Small { products: IdMap::new(&products), campaigns: IdMap::new(&campaigns).with_short(&campaigns), cat_names, cat_rank, unknown_cat, camp_ids, camp_channel }
 }
 
 /// rules.md "Linked IDs": every link line joins its two IDs in the ID table. Returns the number of lines joined.
@@ -2060,7 +2223,9 @@ fn build_links(ids: &IdTable, names: &Interner, files: &[InFile], threads: usize
                 }
                 if ids.slots[i].up.load(Relaxed) != 0 {
                     // i hangs under something, so its root is another slot
-                    ids.slots[i].up.store(ids.find(i as u32) + 1, Relaxed);
+                    let root = ids.find(i as u32);
+                    ids.slots[i].up.store(root + 1, Relaxed);
+                    ids.slots[i].px.store(i as u32 ^ root, Relaxed);
                 }
             }
         },
@@ -2096,37 +2261,37 @@ fn event_fields(cx: &Ctx, [eid, uid, ts, ingest, etype, pid, price]: [Bytes; 7],
     }
 }
 
-/// `split::<7>` + `event_fields` for the line of `e` (< 128) bytes at `line`, given its comma and quote bits;
-/// line[e] is its `\n` and line[..144] is readable.
+/// `event_fields` for the line at `line` with its first three fields `a` and, from `rest`, its other four `b`
+/// (`split_event`); line[..144] is readable.
 #[inline(always)]
-unsafe fn fast_event(cx: &Ctx, line: *const u8, e: usize, m: [u64; 4], st: &mut Shard) {
-    let Some(f) = fast_split::<7>(e, m) else { return };
-    let (ep, el) = (line.add(f.at(0)), f.len(0));
+unsafe fn fast_event(cx: &Ctx, line: *const u8, mut a: Cut, rest: *const u8, mut b: Cut, st: &mut Shard) {
+    let (es, el) = a.next();
     if el == 0 {
         return;
     }
-    let Some(ingest) = ts_memo(line.add(f.at(3)), f.len(3), &mut st.days) else { return };
-    let (ul, pl) = (f.len(1), f.len(5));
-    let up = line.add(f.at(1));
-    // the user ID's key comes with the event ID's; 0 = it does not pack (interned below, if the event is kept)
-    let (ekey, upacked) = cx.names.key2_at(ep, el, up, ul);
-    let ts = match ts_memo(line.add(f.at(2)), f.len(2), &mut st.days) {
+    let (is, il) = b.next();
+    let Some(ingest) = ts_memo(rest.add(is), il, &mut st.days) else { return };
+    let ekey = cx.names.key_at(line.add(es), el);
+    let (us, ul) = a.next();
+    let (ts, tl) = a.next();
+    let (ks, kl) = b.next();
+    let (ps, pl) = b.next();
+    let ts = match ts_memo(line.add(ts), tl, &mut st.days) {
         Some(t) if ul != 0 && pl != 0 && t >= cx.ws && t < cx.we && ingest - t <= DAY => t,
         _ => return st.log(cx, ekey, ingest, 0),
     };
-    let (kp, kl) = (line.add(f.at(4)), f.len(4));
-    let w = (kp as *const u64).read_unaligned();
+    let w = (rest.add(ks) as *const u64).read_unaligned();
     let pay = match kl {
         4 if w as u32 == u32::from_le_bytes(*b"view") || w as u32 == u32::from_le_bytes(*b"cart") => 0,
         8 if w == u64::from_le_bytes(*b"purchase") => {
-            let Some(p) = parse_price(std::slice::from_raw_parts(line.add(f.at(6)), f.len(6))) else { return st.log(cx, ekey, ingest, 0) };
-            let cat = cx.products.get_at(line.add(f.at(5)), pl).unwrap_or(cx.unknown_cat);
+            let (cs, cl) = b.next();
+            let Some(p) = parse_price(std::slice::from_raw_parts(rest.add(cs), cl)) else { return st.log(cx, ekey, ingest, 0) };
+            let cat = cx.products.get_at(rest.add(ps), pl).unwrap_or(cx.unknown_cat);
             (cat as u32) << 24 | p
         }
         _ => return st.log(cx, ekey, ingest, 0),
     };
-    let ukey = if upacked != 0 { upacked } else { cx.names.intern(std::slice::from_raw_parts(up, ul)) };
-    st.keep(cx, ekey, ingest, ukey, ts, pay);
+    st.keep(cx, ekey, ingest, cx.names.key_at(line.add(us), ul), ts, pay);
 }
 
 /// Parses the event lines that start in [start, end) of the `len` bytes at `buf` (see `scan_lines`) into `st`.
@@ -2137,7 +2302,13 @@ unsafe fn parse_events(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: 
         end,
         len,
         st,
-        |st, line, e, m| fast_event(cx, line, e, m, st),
+        |st, line| match split_event(line) {
+            Some((a, b, o, n)) => {
+                fast_event(cx, line, a, line.add(o), b, st);
+                n
+            }
+            None => 0,
+        },
         |st, l| {
             if let Some(f) = split::<7>(l) {
                 event_fields(cx, f, st);
@@ -2162,20 +2333,20 @@ fn click_fields(cx: &Ctx, [cid, uid, camp, ts]: [Bytes; 4], st: &mut Shard) {
 }
 
 #[inline(always)]
-unsafe fn fast_click(cx: &Ctx, line: *const u8, e: usize, m: [u64; 4], st: &mut Shard) {
-    let Some(f) = fast_split::<4>(e, m) else { return };
-    if f.len(0) == 0 || f.len(1) == 0 {
+unsafe fn fast_click(cx: &Ctx, line: *const u8, mut f: Cut, st: &mut Shard) {
+    let (cs, cl) = f.next();
+    let (us, ul) = f.next();
+    if cl == 0 || ul == 0 {
         return;
     }
-    let t = match ts_memo(line.add(f.at(3)), f.len(3), &mut st.days) {
+    let (ks, kl) = f.next();
+    let (ts, tl) = f.next();
+    let t = match ts_memo(line.add(ts), tl, &mut st.days) {
         Some(t) if t >= cx.base && t < cx.we => t,
         _ => return,
     };
-    let Some(camp) = cx.campaigns.get_at(line.add(f.at(2)), f.len(2)) else { return };
-    let (up, ul) = (line.add(f.at(1)), f.len(1));
-    let (cid, upacked) = cx.names.key2_at(line.add(f.at(0)), f.len(0), up, ul);
-    let ukey = if upacked != 0 { upacked } else { cx.names.intern(std::slice::from_raw_parts(up, ul)) };
-    st.click(cx, cid, ukey, t, camp);
+    let Some(camp) = cx.campaigns.get_short(line.add(ks), kl) else { return };
+    st.click(cx, cx.names.key_at(line.add(cs), cl), cx.names.key_at(line.add(us), ul), t, camp);
 }
 
 unsafe fn parse_clicks(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: usize, st: &mut Shard) {
@@ -2185,7 +2356,13 @@ unsafe fn parse_clicks(cx: &Ctx, buf: *const u8, start: usize, end: usize, len: 
         end,
         len,
         st,
-        |st, line, e, m| fast_click(cx, line, e, m, st),
+        |st, line| match split_click(line) {
+            Some((f, n)) => {
+                fast_click(cx, line, f, st);
+                n
+            }
+            None => 0,
+        },
         |st, l| {
             if let Some(f) = split::<4>(l) {
                 click_fields(cx, f, st);
@@ -2215,6 +2392,57 @@ fn line_match(line: &[u32; 16], tag: u32) -> (u32, u32) {
     (0..8).fold((0, 0), |(e, z), k| (e | ((line[k] == tag) as u32) << k, z | ((line[k] == 0) as u32) << k))
 }
 
+/// One record into the duplicate finder's table (`lines` = mask + 1 lines at `tp`, a record's line = fib(key) >> shift);
+/// a repeat of a tag joins (or starts) that tag's group: see `mark_duplicates`.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn dup_insert(tp: *mut DLine, mask: usize, shift: u32, qb: u32, r: &LRec, me: u32, mem: &mut Vec<(LRec, u32)>, groups: &mut Vec<(u32, u32)>, firsts: &mut Vec<(u32, u32)>) {
+    let h = r.key.wrapping_mul(0x9E37_79B9_7F4A_7C15); // `fib` of mark_duplicates
+    let tag = (h >> 8) as u32 | 1;
+    // the event-key bucket is the top `qb` bits of this same product: take the line from the bits below them, or every record of a
+    // bucket would pile into 1/2^qb of the lines (20M events in 17 s)
+    let mut l = ((h << qb) >> shift) as usize;
+    loop {
+        // SAFETY: l <= mask, a line of the table
+        let line = &mut (*tp.add(l)).0;
+        let (eq, empty) = line_match(line, tag);
+        if eq != 0 {
+            let at = 8 + eq.trailing_zeros() as usize;
+            let x = mem.len() as u32;
+            if line[at] < DUP_GRP {
+                // the tag's first repeat: a new group of the record it met (copied later) and this one
+                if groups.len() as u32 >= u32::MAX - DUP_GRP {
+                    die("too many duplicate groups in one event-key bucket");
+                }
+                firsts.push((x, line[at]));
+                mem.push((*r, x + 2));
+                mem.push((*r, 0));
+                line[at] = DUP_GRP + groups.len() as u32;
+                groups.push((x, x + 1));
+            } else {
+                let g = &mut groups[(line[at] - DUP_GRP) as usize];
+                mem[g.1 as usize].1 = x + 1;
+                mem.push((*r, 0));
+                g.1 = x;
+            }
+            return;
+        }
+        if empty != 0 {
+            let at = empty.trailing_zeros() as usize;
+            line[at] = tag;
+            line[8 + at] = me;
+            return;
+        }
+        l = (l + 1) & mask;
+    }
+}
+
+/// A record's position in `mark_duplicates`: shard << DUP_POS_T | index in that shard's stream of the bucket. With at
+/// most 127 shards a position + 1 is at most 127 << DUP_POS_T < DUP_GRP: a table slot at or above DUP_GRP holds a
+/// group number + DUP_GRP instead.
+const DUP_POS_T: u32 = 25;
+const DUP_GRP: u32 = (127 << DUP_POS_T) + 1;
+
 /// rules.md "Events" 2: per event-key bucket, among the copies of one event_id the smallest ingest_ts is kept and
 /// every other valid copy is marked dropped. Returns the number of records whose tag repeats.
 ///
@@ -2224,10 +2452,7 @@ fn line_match(line: &[u32; 16], tag: u32) -> (u32, u32) {
 /// the group starts with the record it met), chained in `mem`. All copies of a key share its tag, so they all meet
 /// in one group; a few other keys do too and are told apart by key.
 fn mark_duplicates(shards: &[Shard], buckets: usize, threads: usize) -> usize {
-    // a record's position: shard << POS_T | index in that shard's stream of the bucket. With at most 127 shards a
-    // position + 1 is at most 127 << POS_T < GRP: a table slot at or above GRP holds a group number + GRP instead
-    const POS_T: u32 = 25;
-    const GRP: u32 = (127 << POS_T) + 1;
+    const POS_T: u32 = DUP_POS_T;
     if shards.len() > 127 || shards.iter().any(|s| s.lg.iter().any(|l| l.len(LG_BLOCK) >> POS_T != 0)) {
         die("too many events for the duplicate finder");
     }
@@ -2252,48 +2477,46 @@ fn mark_duplicates(shards: &[Shard], buckets: usize, threads: usize) -> usize {
                 // SAFETY: i < the stream's length, so block i / LG_BLOCK holds it
                 unsafe { shards[t].lg[b].blocks[i / LG_BLOCK].add(i % LG_BLOCK) as *const LRec }
             };
+            let tp = table.as_mut_ptr();
+            // one record into the table; a repeat of a tag joins (or starts) that tag's group
+            let qb = buckets.trailing_zeros();
+            let mut insert = |r: &LRec, me: u32| unsafe { dup_insert(tp, mask, shift, qb, r, me, mem, groups, firsts) };
+            let line_of = |r: &LRec| unsafe { tp.add(((fib(r.key) << qb) >> shift) as usize) };
+            // ahead of record i: its stream RA records on, and the table line of the record LA on
+            const RA: usize = 40;
+            const LA: usize = 8;
             for (t, s) in shards.iter().enumerate() {
                 let mut me = ((t as u32) << POS_T) + 1;
-                for blk in s.lg[b].slices(LG_BLOCK) {
-                    for (i, r) in blk.iter().enumerate() {
-                        if let Some(f) = blk.get(i + 8) {
-                            prefetch(&table[(fib(f.key) >> shift) as usize]);
-                        }
-                        let h = fib(r.key);
-                        let tag = (h >> 8) as u32 | 1;
-                        let mut l = (h >> shift) as usize;
-                        loop {
-                            let line = &mut table[l].0;
-                            let (eq, empty) = line_match(line, tag);
-                            if eq != 0 {
-                                let at = 8 + eq.trailing_zeros() as usize;
-                                let x = mem.len() as u32;
-                                if line[at] < GRP {
-                                    // the tag's first repeat: a new group of the record it met (copied below) and this one
-                                    if groups.len() as u32 >= u32::MAX - GRP {
-                                        die("too many duplicate groups in one event-key bucket");
-                                    }
-                                    firsts.push((x, line[at]));
-                                    mem.push((*r, x + 2));
-                                    mem.push((*r, 0));
-                                    line[at] = GRP + groups.len() as u32;
-                                    groups.push((x, x + 1));
-                                } else {
-                                    let g = &mut groups[(line[at] - GRP) as usize];
-                                    mem[g.1 as usize].1 = x + 1;
-                                    mem.push((*r, 0));
-                                    g.1 = x;
-                                }
-                                break;
+                let blks: Vec<&[LRec]> = s.lg[b].slices(LG_BLOCK).collect();
+                for (k, &blk) in blks.iter().enumerate() {
+                    let n = blk.len();
+                    let p = blk.as_ptr();
+                    // all but the last RA records: the records ahead are in this block
+                    let body = n.saturating_sub(RA) & !3;
+                    for i in (0..body).step_by(4) {
+                        // SAFETY: i + 3 + RA < n
+                        unsafe {
+                            prefetch(p.add(i + RA));
+                            for j in i..i + 4 {
+                                prefetch(line_of(&*p.add(j + LA)));
+                                insert(&*p.add(j), me);
+                                me += 1;
                             }
-                            if empty != 0 {
-                                let at = empty.trailing_zeros() as usize;
-                                line[at] = tag;
-                                line[8 + at] = me;
-                                break;
-                            }
-                            l = (l + 1) & mask;
                         }
+                    }
+                    // the rest: the records ahead may be in the next block
+                    let nb: &[LRec] = blks.get(k + 1).copied().unwrap_or(&[]);
+                    let after = |i: usize| if i < n { blk.get(i) } else { nb.get(i - n) };
+                    for i in body..n {
+                        if i % 4 == 0 {
+                            if let Some(f) = after(i + RA) {
+                                prefetch(f);
+                            }
+                        }
+                        if let Some(f) = after(i + LA) {
+                            prefetch(line_of(f));
+                        }
+                        insert(&blk[i], me);
                         me += 1;
                     }
                 }
@@ -2663,7 +2886,7 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
     for s in shards {
         for blk in s.ck[p].slices(CK_BLOCK) {
             for r in blk {
-                let l = (r.person & lmask) as usize;
+                let l = r.local() as usize;
                 w.cstart[l + 1] += (w.start[l + 1] != w.start[l]) as u32;
             }
         }
@@ -2680,10 +2903,10 @@ fn partition_work(cx: &Ctx, shards: &[Shard], p: usize, w: &mut Work) {
     for s in shards {
         for blk in s.ck[p].slices(CK_BLOCK) {
             for r in blk {
-                let l = (r.person & lmask) as usize;
+                let l = r.local() as usize;
                 if w.start[l + 1] != w.start[l] {
                     let f = &mut w.cfill[l];
-                    w.ck[*f as usize] = Ck { k: (r.ts as u64) << 32 | r.camp as u64, cid: r.cid };
+                    w.ck[*f as usize] = Ck { k: (r.ts() as u64) << 32 | r.camp() as u64, cid: r.cid };
                     *f += 1;
                 }
             }
@@ -3272,12 +3495,12 @@ fn page_slices<'a>(segs: &[&'a [UserRow]], lo: usize, hi: usize, out: &mut Vec<&
 #[inline]
 fn put_name(b: &mut Vec<u8>, names: &Interner, k: u64, tmp: &mut Vec<u8>) {
     if k & INTERNED == 0 {
-        // a packed ID: five digit pairs to ten bytes, the zero digits past its length cut off
-        let mut buf = [0u8; 10];
-        for (i, sh) in [48, 36, 24, 12, 0].into_iter().enumerate() {
-            buf[2 * i..2 * i + 2].copy_from_slice(&PAIRS[((k >> sh) & 0xfff) as usize].to_le_bytes());
+        // a packed ID: nine 7-bit bytes, first byte highest; the zero bytes past its length cut off
+        let mut buf = [0u8; 9];
+        for (i, c) in buf.iter_mut().enumerate() {
+            *c = ((k >> (56 - 7 * i)) & 127) as u8;
         }
-        let len = 10 - (k.trailing_zeros() / 6) as usize;
+        let len = 9 - (k.trailing_zeros() / 7) as usize;
         b.extend_from_slice(&(len as u32).to_le_bytes());
         b.extend_from_slice(&buf[..len]);
         return;
@@ -3287,17 +3510,6 @@ fn put_name(b: &mut Vec<u8>, names: &Interner, k: u64, tmp: &mut Vec<u8>) {
     b.extend_from_slice(&(tmp.len() as u32).to_le_bytes());
     b.extend_from_slice(tmp);
 }
-
-/// The 6-bit digit pairs of a packed ID as two bytes: 4096 entries, the first character in the low byte.
-static PAIRS: [u16; 4096] = {
-    let mut t = [0u16; 4096];
-    let mut x = 0;
-    while x < 4096 {
-        t[x] = UNPACK[x >> 6] as u16 | (UNPACK[x & 63] as u16) << 8;
-        x += 1;
-    }
-    t
-};
 
 /// DELTA_BINARY_PACKED body of `v`: blocks of 128 deltas in four miniblocks of 32, each miniblock at the bit width
 /// its largest value (delta minus the block's smallest delta) needs.
@@ -3481,6 +3693,26 @@ fn write_camps(path: &Path, rows: &[CampRow]) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn short_lookup_matches_get() {
+        // IDs of 1..=10 bytes, with a NUL byte, a shared prefix, a trailing NUL: `get_short` agrees with `get`
+        let ids: Vec<&'static [u8]> = vec![b"c_1", b"c_12", b"c_123", b"c_1234", b"c_12345", b"c_123456", b"c_1234567", b"c_12345678", b"a", b"a\0", b"a\0\0", b"\0", b"\xff\xfe", b"x_y_z_w"];
+        let list: Vec<(Bytes, u16)> = ids.iter().enumerate().map(|(i, &b)| (b, i as u16)).collect();
+        let m = IdMap::new(&list).with_short(&list);
+        let mut rng = Rng(0x1234_5678_9abc_def1);
+        let mut probes: Vec<Vec<u8>> = ids.iter().map(|b| b.to_vec()).collect();
+        for _ in 0..3000 {
+            let n = rng.below(11);
+            probes.push((0..n).map(|_| [b'c', b'_', b'1', b'2', b'a', 0, 255][rng.below(7)]).collect());
+        }
+        for p in probes {
+            let mut buf = p.clone();
+            buf.resize(p.len() + 16, 0x5a); // 16 readable bytes after the ID
+            let got = unsafe { m.get_short(buf.as_ptr(), p.len()) };
+            assert_eq!(got, m.get(&p), "id {p:?}");
+        }
+    }
+
     struct Rng(u64);
     impl Rng {
         fn next(&mut self) -> u64 {
@@ -3606,7 +3838,7 @@ mod tests {
             ndays: 14,
             ncamp: 0,
             products,
-            campaigns: IdMap::new(&[(&b"c_1"[..], 0u16), (&b"c_22"[..], 1u16), (&b"campaign-three"[..], 2u16)]),
+            campaigns: IdMap::new(&[]).with_short(&[]),
             unknown_cat: 2,
             cat_rank: vec![0, 1, 2],
             ids: IdTable::new(16),
@@ -3619,8 +3851,7 @@ mod tests {
     /// (events as (person, ts, pay), dedup records as (key, ingest, has a record)), each sorted
     type Flat = (Vec<(u32, u32, u32)>, Vec<(u64, i64, bool)>);
     fn flat(st: &mut Shard) -> Flat {
-        st.ev.iter_mut().for_each(Stream::finish);
-        st.lg.iter_mut().for_each(Stream::finish);
+        st.settle();
         let mut ev: Vec<_> = st.ev.iter().flat_map(|s| s.slices(EV_BLOCK)).flatten().map(|r| (r.person, r.ts, r.pay)).collect();
         let mut lg: Vec<_> = st.lg.iter().flat_map(|s| s.slices(LG_BLOCK)).flatten().map(|r| (r.key, r.ingest, r.loc != 0)).collect();
         ev.sort();
@@ -3628,40 +3859,81 @@ mod tests {
         (ev, lg)
     }
 
-    /// `fast_split` (with the masks `scan_lines` computes) agrees with `split` on random lines made of the bytes
-    /// that matter (from arena/c2's tests).
-    fn fast_split_vs_split<const N: usize>(seed: u64) {
-        let mut r = Rng(seed);
-        let atoms = ["a", ",", "\"", "\"\"", "xy", "\r", " ", "\"ab\"", "1234567"];
-        for _ in 0..200_000 {
+    /// `split_event` and `split_click` agree with `split` on every line they take, and take the usual ones: random
+    /// lines made of the bytes that matter, and lines of the generator's shape with fields quoted at random.
+    #[test]
+    fn window_split_matches_split() {
+        let mut r = Rng(3);
+        let atoms = ["a", ",", "\"", "\"\"", "xy", "\r", " ", "\"ab\"", "1234567", "e4ajy5dva", "2027-12-18T22:22:54Z", "\n"];
+        let (mut took7, mut took4, mut usual7, mut usual4) = (0, 0, 0, 0);
+        for round in 0..600_000 {
+            let n = if round % 2 == 0 { 7 } else { 4 };
             let mut line = String::new();
-            for _ in 0..r.below(40) {
-                line += r.pick(&atoms);
+            let usual = round % 3 == 0;
+            if usual {
+                let ev = ["e4ajy5dva", "u24wwm60w", "2027-12-21T10:03:10-02:00", "2027-12-18T22:22:54Z", "purchase", "p38449", "41607"];
+                let ck = ["k9pbmgz1e", "u8nj7nrj5", "c_332", "2027-12-21T10:03:10-02:00"];
+                let fields: Vec<String> = (0..n)
+                    .map(|i| {
+                        let v = if n == 7 { ev[i] } else { ck[i] };
+                        let v = if r.below(6) == 0 { "" } else { v };
+                        if r.below(3) == 0 { format!("\"{v}\"") } else { v.to_string() }
+                    })
+                    .collect();
+                line = fields.join(",");
+            } else if round % 3 == 1 {
+                // about the right number of fields, each a few atoms
+                let k = if r.below(8) == 0 { n - 1 + r.below(3) } else { n };
+                let fields: Vec<String> = (0..k).map(|_| (0..r.below(3)).map(|_| r.pick(&atoms[2..])).collect::<String>()).collect();
+                line = fields.join(",");
+                line.truncate(126);
+            } else {
+                for _ in 0..r.below(30) {
+                    line += r.pick(&atoms);
+                }
+                line.truncate(126);
             }
-            line.truncate(126);
             let mut buf = line.clone().into_bytes();
             buf.push(b'\n');
-            buf.resize(buf.len() + 200, b'z');
-            let want = split::<N>(Box::leak(line.clone().into_bytes().into_boxed_slice())).map(|f| f.map(|x| x.to_vec()));
-            let got = unsafe {
-                let p = buf.as_ptr();
-                let [c0, q0, n0] = masks64(p);
-                let [c1, q1, n1] = masks64(p.add(64));
-                let e = (n0 as u128 | (n1 as u128) << 64).trailing_zeros() as usize;
-                assert_eq!(e, line.len());
-                let lm = (1u128 << e) - 1;
-                fast_split::<N>(p, e, (c0 as u128 | (c1 as u128) << 64) & lm, (q0 as u128 | (q1 as u128) << 64) & lm)
+            // what follows the line must not matter
+            let tail = ["z", ",", "\"", "\n"];
+            for _ in 0..200 {
+                buf.extend_from_slice(r.pick(&tail).as_bytes());
             }
-            .map(|f| f.map(|(s, l)| buf[s..s + l].to_vec()));
-            assert_eq!(got, want, "line {line:?}");
+            let first = line.split('\n').next().unwrap().to_string();
+            let text: Bytes = Box::leak(first.clone().into_bytes().into_boxed_slice());
+            let (got, want) = if n == 7 {
+                let got = unsafe { split_event(buf.as_ptr()) }.map(|(mut a, mut b, o, n)| {
+                    let mut f: Vec<(usize, usize)> = (0..3).map(|_| a.next()).collect();
+                    f.extend((0..4).map(|_| b.next()).map(|(s, l)| (o + s, l)));
+                    (f, n)
+                });
+                (got, split::<7>(text).map(|f| f.map(|x| x.to_vec()).to_vec()))
+            } else {
+                let got = unsafe { split_click(buf.as_ptr()) }.map(|(mut f, n)| ((0..4).map(|_| f.next()).collect::<Vec<_>>(), n));
+                (got, split::<4>(text).map(|f| f.map(|x| x.to_vec()).to_vec()))
+            };
+            if let Some((f, len)) = &got {
+                let len = *len;
+                assert_eq!(len, first.len() + 1, "line {line:?}");
+                let f: Vec<Vec<u8>> = f.iter().map(|&(s, l)| buf[s..s + l].to_vec()).collect();
+                assert_eq!(Some(f), want, "line {line:?}");
+                if n == 7 {
+                    took7 += 1;
+                } else {
+                    took4 += 1;
+                }
+            }
+            if usual {
+                assert!(got.is_some() && want.is_some(), "line {line:?}");
+                if n == 7 {
+                    usual7 += 1;
+                } else {
+                    usual4 += 1;
+                }
+            }
         }
-    }
-
-    #[test]
-    fn fast_split_matches_split() {
-        fast_split_vs_split::<2>(1);
-        fast_split_vs_split::<4>(2);
-        fast_split_vs_split::<7>(3);
+        assert!(usual7 > 90_000 && usual4 > 90_000 && took7 > usual7 + 10_000 && took4 > usual4 + 10_000, "{took7} {took4} {usual7} {usual4}");
     }
 
     #[test]
@@ -3715,9 +3987,11 @@ mod tests {
     #[test]
     fn streams_keep_every_record_where_push_said() {
         let mut r = Rng(17);
-        let mut arena = Arena { cur: 0, end: 0 };
+        let mut arena = Arena::new();
         let mut s12: Vec<Stream<ERec>> = (0..23).map(|_| Stream::new()).collect();
         let mut s24: Vec<Stream<LRec>> = (0..23).map(|_| Stream::new()).collect();
+        let mut h12: Vec<Hot<ERec>> = (0..23).map(|_| Hot::new()).collect();
+        let mut h24: Vec<Hot<LRec>> = (0..23).map(|_| Hot::new()).collect();
         let mut want12: Vec<Vec<(u32, u32, u32)>> = vec![Vec::new(); 23];
         let mut want24: Vec<Vec<(u64, i64, u64)>> = vec![Vec::new(); 23];
         let mut at: Vec<(*mut ERec, u32)> = Vec::new();
@@ -3725,17 +3999,16 @@ mod tests {
             let b = r.below(23);
             if r.below(2) == 0 {
                 let rec = ERec { person: i, ts: r.next() as u32, pay: b as u32 };
-                at.push((s12[b].push(&mut arena, EV_BLOCK, rec), i));
+                at.push((h12[b].push(&mut s12[b], &mut arena, EV_BLOCK, rec), i));
                 want12[b].push((rec.person, rec.ts, rec.pay));
             } else {
                 let rec = LRec { key: r.next(), ingest: i as i64, loc: b as u64 };
-                s24[b].push(&mut arena, LG_BLOCK, rec);
+                h24[b].push(&mut s24[b], &mut arena, LG_BLOCK, rec);
                 want24[b].push((rec.key, rec.ingest, rec.loc));
             }
         }
-        sfence();
-        s12.iter_mut().for_each(Stream::finish);
-        s24.iter_mut().for_each(Stream::finish);
+        h12.iter().zip(&mut s12).for_each(|(h, s)| s.cur = h.cur);
+        h24.iter().zip(&mut s24).for_each(|(h, s)| s.cur = h.cur);
         for b in 0..23 {
             let got: Vec<_> = s12[b].slices(EV_BLOCK).flatten().map(|r| (r.person, r.ts, r.pay)).collect();
             assert_eq!(got, want12[b]);
@@ -3783,149 +4056,6 @@ mod tests {
         assert!(kept > 1000, "too few kept events ({kept}) to mean anything");
     }
 
-    /// `fast_split` against `split` on lines of every length under 128, their separators and quotes on every side
-    /// of the 64-byte boundary.
-    #[test]
-    fn fast_split_matches_split() {
-        fn check<const N: usize>(r: &mut Rng, rounds: usize) -> usize {
-            let mut good = 0;
-            for _ in 0..rounds {
-                let nf = if r.below(12) == 0 { r.below(10) } else { N };
-                let total = r.below(127);
-                let mut line = String::new();
-                for i in 0..nf {
-                    if i > 0 {
-                        line.push(',');
-                    }
-                    let room = total.saturating_sub(line.len());
-                    let most = if r.below(3) == 0 { 70 } else { 12 };
-                    let v = "x".repeat(r.below(room.min(most) + 1));
-                    line += &match r.below(16) {
-                        0..=4 => format!("\"{v}\""),
-                        5 => format!("\"{v}"),
-                        6 => format!("{v}\""),
-                        7 => r.pick(&["\"", "\"\"", "\"\"\"", "a\"b", "\"a\"b\"", "\"\"a"]).to_string(),
-                        _ => v,
-                    };
-                }
-                if line.len() > 127 {
-                    continue;
-                }
-                let mut buf = format!("header\n{line}").into_bytes();
-                buf.extend_from_slice(&[b'\n'; PAD]);
-                let text: Bytes = Box::leak(line.clone().into_bytes().into_boxed_slice());
-                let want = split::<N>(text).map(|f| f.map(|x| (x.as_ptr() as usize - text.as_ptr() as usize, x.len())));
-                let mut got = None;
-                let mut seen = 0;
-                unsafe {
-                    scan_lines(
-                        buf.as_ptr(),
-                        0,
-                        usize::MAX,
-                        7 + line.len() + 1,
-                        &mut (&mut got, &mut seen),
-                        |st, _, e, m| {
-                            if *st.1 == 0 {
-                                assert_eq!(e, line.len());
-                                *st.0 = fast_split::<N>(e, m).map(|f| std::array::from_fn::<_, N, _>(|i| (f.at(i), f.len(i))));
-                            }
-                            *st.1 += 1;
-                        },
-                        |_, _| panic!("a line under 128 bytes went the slow way"),
-                    );
-                }
-                // an empty field keeps its place but `split` gives it no address of its own: compare lengths then
-                let same = match (&got, &want) {
-                    (Some(g), Some(w)) => g.iter().zip(w.iter()).all(|(g, w)| g.1 == w.1 && (w.1 == 0 || g.0 == w.0)),
-                    (None, None) => true,
-                    _ => false,
-                };
-                assert!(same && seen == 1, "{line:?}: {got:?} vs {want:?}");
-                good += want.is_some() as usize;
-            }
-            good
-        }
-        let mut r = Rng(0x0dd_ba11_5eed);
-        assert!(check::<7>(&mut r, 400_000) > 50_000);
-        assert!(check::<4>(&mut r, 400_000) > 50_000);
-        assert!(check::<1>(&mut r, 20_000) > 1_000);
-        assert!(check::<8>(&mut r, 100_000) > 10_000);
-    }
-
-    /// `parse_clicks` against `for_records` + `click_fields`.
-    #[test]
-    fn fast_clicks_match_reference() {
-        let c = ctx();
-        let mut r = Rng(0x0c11_c5_5eed);
-        let mut kept = 0;
-        for round in 0..300 {
-            let mut text = String::from("click_id,user_id,campaign_id,ts\n");
-            for _ in 0..r.below(400) {
-                let id = |r: &mut Rng, c: char| -> String {
-                    match r.below(14) {
-                        0 => String::new(),
-                        1 => format!("{c}{}", "x".repeat(r.below(40))),
-                        2 => format!(" {c}{}", r.below(1000)),
-                        3 => format!("{c}-{}", r.below(1000)),
-                        _ => format!("{c}{:x}", r.next() % (1u64 << (4 * (4 + r.below(7))))),
-                    }
-                };
-                let mut f = vec![
-                    id(&mut r, 'k'),
-                    id(&mut r, 'u'),
-                    r.pick(&["c_1", "c_22", "campaign-three", "c_3", "C_1", "", "c_1 ", "c_22", "c_1"]).to_string(),
-                    if r.below(4) == 0 { ts_value(&mut r) } else { r.pick(&["2028-02-13T00:00:00Z", "2028-02-12T23:59:59Z", "2028-03-04T23:59:59-00:00", "1835049600000", "2028-02-25T10:00:00+05:30"]).to_string() },
-                ];
-                for v in f.iter_mut() {
-                    *v = match r.below(24) {
-                        0..=5 => format!("\"{v}\""),
-                        6 => format!("\"{v}"),
-                        7 => format!("{v}\""),
-                        8 => r.pick(&["\"", "\"\"", "\"\"\"", "a\"b"]).to_string(),
-                        _ => v.clone(),
-                    };
-                }
-                match r.below(60) {
-                    0 => {
-                        f.pop();
-                    }
-                    1 => f.push(String::new()),
-                    2 => f[r.below(4)] = "x".repeat(100 + r.below(60)),
-                    _ => {}
-                }
-                text += &f.join(",");
-                text.push('\n');
-            }
-            if round % 3 == 0 {
-                text += "k1,u1,c_1,2028-02-25T10:00:00Z"; // no trailing newline
-            }
-            let len = text.len();
-            let mut padded = text.clone().into_bytes();
-            padded.extend_from_slice(&[b'\n'; PAD]);
-            let file: Bytes = Box::leak(text.into_bytes().into_boxed_slice());
-            let mut cuts = vec![0, len];
-            for _ in 0..r.below(4) {
-                cuts.push(r.below(len + 1));
-            }
-            cuts.sort();
-            let (mut a, mut b) = (Shard::new(16, 16), Shard::new(16, 16));
-            for w in cuts.windows(2) {
-                unsafe { parse_clicks(&c, padded.as_ptr(), w[0], w[1], len, &mut a) };
-                for_records::<4>(file, w[0], w[1], |f| click_fields(&c, f, &mut b));
-                b.flush(&c, false);
-            }
-            let clicks = |st: &Shard| {
-                let mut v: Vec<_> = st.ck.iter().flat_map(|s| s.slices(CK_BLOCK)).flatten().map(|r| (r.cid, r.person, r.ts, r.camp)).collect();
-                v.sort();
-                v
-            };
-            let (ca, cb) = (clicks(&a), clicks(&b));
-            kept += cb.len();
-            assert!(ca == cb, "round {round}: fast clicks differ\n{}", std::str::from_utf8(file).unwrap());
-        }
-        assert!(kept > 1000, "too few kept clicks ({kept}) to mean anything");
-    }
-
     #[test]
     fn ts_at_matches_parse_ts() {
         let mut r = Rng(0xfeed_beef_1357_9bdf);
@@ -3942,70 +4072,63 @@ mod tests {
             hits += (want.is_some() && s.len() >= 20 && before.iter().zip(&days).all(|(x, y)| x.a == y.a && x.b == y.b)) as usize;
         }
         assert!(hits > 20_000, "the memo was hit only {hits} times");
+        // 13 bytes, the F3 length with its own path: digits, and now and then any other byte anywhere
+        let mut good = 0;
+        for i in 0..300_000 {
+            let mut buf: Vec<u8> = (0..13).map(|_| b'0' + r.below(10) as u8).collect();
+            if i % 3 == 0 {
+                buf[r.below(13)] = *[0u8, b'/', b':', b' ', 0x7f, 0x80, 0xb9, 0xff, b'a', b'-', b'.'].get(r.below(11)).unwrap();
+            }
+            let want = parse_ts(&buf);
+            good += want.is_some() as usize;
+            buf.extend_from_slice(&[b'7'; 32]);
+            assert_eq!(unsafe { ts_at(buf.as_ptr(), 13) }, want, "{:?}", &buf[..13]);
+        }
+        assert!(good > 150_000);
     }
 
     #[test]
     fn pack_at_matches_pack_and_keeps_order() {
         let mut r = Rng(42);
-        let alphabet: Vec<u8> = (0u8..=255).filter(|&c| PACK[c as usize] != 0).collect();
-        assert_eq!(alphabet.len(), 63);
         let names = Interner::new();
         let mut prev: Option<(Vec<u8>, u64)> = None;
-        for i in 0..200_000 {
-            let len = r.below(13);
-            let mut id: Vec<u8> = (0..len).map(|_| alphabet[r.below(63)]).collect();
+        let mut packed = 0;
+        for i in 0..300_000 {
+            let len = r.below(12);
+            let mut id: Vec<u8> = (0..len).map(|_| 1 + r.below(127) as u8).collect();
             if i % 5 == 0 && len > 0 {
-                id[r.below(len)] = r.next() as u8; // usually a byte that does not pack
+                id[r.below(len)] = [0u8, 0x80, 0xff, 0xc3, 0x7f, 1][r.below(6)]; // mostly bytes that do not pack
             }
             let mut buf = id.clone();
             buf.extend((0..32).map(|_| r.next() as u8));
             let k = pack(&id);
+            assert_eq!(k != 0, (1..=9).contains(&len) && id.iter().all(|&c| c != 0 && c < 128), "{id:?}");
             assert_eq!(unsafe { pack_at(buf.as_ptr(), len) }, k, "{id:?}");
-            // as either half of a pair, beside an ID of another length
-            let other: Vec<u8> = (0..32).map(|j| if j < i % 14 { alphabet[r.below(63)] } else { r.next() as u8 }).collect();
-            let ko = pack(&other[..i % 14]);
-            assert_eq!(unsafe { pack2_at(buf.as_ptr(), len, other.as_ptr(), i % 14) }, (k, ko), "{id:?}");
-            assert_eq!(unsafe { pack2_at(other.as_ptr(), i % 14, buf.as_ptr(), len) }, (ko, k), "{id:?}");
             if k == 0 {
                 continue;
             }
+            packed += 1;
+            assert!(k & INTERNED == 0);
             let mut back = Vec::new();
             names.bytes(k, &mut back);
             assert_eq!(back, id);
+            let (mut out, mut tmp) = (Vec::new(), Vec::new());
+            put_name(&mut out, &names, k, &mut tmp);
+            assert_eq!(out[..4], (id.len() as u32).to_le_bytes());
+            assert_eq!(out[4..], id[..]);
             if let Some((pid, pk)) = &prev {
                 assert_eq!(pid.cmp(&id), pk.cmp(&k), "{pid:?} {id:?}");
             }
             prev = Some((id, k));
         }
+        assert!(packed > 100_000);
+        // a prefix sorts first, and so does an upper-case variant
+        assert!(pack(b"u1") < pack(b"u10") && pack(b"U9zzzzzzz") < pack(b"u1") && pack(b"u1") != pack(b"u1\0"));
+        assert_eq!(pack(b"0123456789"), 0);
         // IDs that do not pack: exact, and ordered by their bytes against packed ones
-        let (a, b, c) = (names.key(b"user-with-dash"), names.key(b"user-with-dash"), names.key(b" u1"));
+        let (a, b, c) = (names.key(b"user-with-dash"), names.key(b"user-with-dash"), names.key(" \u{e9}1".as_bytes()));
         assert!(a == b && a != c && a & INTERNED != 0);
         assert!(names.less(c, pack(b"u1")) && names.less(pack(b"u1"), a) && !names.less(a, a));
-    }
-
-    /// Every byte value at every place of an ID of every length, among bytes that pack and before bytes that do not.
-    #[test]
-    fn pack_at_matches_pack() {
-        let mut r = Rng(7);
-        for len in 0..=16usize {
-            for at in 0..len.max(1) {
-                for c in 0..=255u8 {
-                    for tail in [0u8, b'a', 0xFF, b'_', b','] {
-                        let mut buf: Vec<u8> = (0..len).map(|_| b"09AZ_az5Qk"[r.below(10)]).collect();
-                        if len > 0 {
-                            buf[at] = c;
-                        }
-                        buf.extend([tail; 32]);
-                        let want = pack(&buf[..len]);
-                        assert_eq!(unsafe { pack_at(buf.as_ptr(), len) }, want, "{:?}", &buf[..len]);
-                        let peer = b"u_9Zz\xFF,,,,,,,,,,,,,,,,,,,,,,,,,,";
-                        let pl = (at + c as usize) % 7;
-                        assert_eq!(unsafe { pack2_at(buf.as_ptr(), len, peer.as_ptr(), pl) }, (want, pack(&peer[..pl])), "{:?}", &buf[..len]);
-                        assert_eq!(unsafe { pack2_at(peer.as_ptr(), pl, buf.as_ptr(), len) }, (pack(&peer[..pl]), want), "{:?}", &buf[..len]);
-                    }
-                }
-            }
-        }
     }
 
     #[test]
