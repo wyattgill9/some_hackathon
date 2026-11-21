@@ -18,6 +18,7 @@ pub struct Pool<T: Copy> {
     done: Vec<Vec<(*mut T, u32)>>,
     region: *mut u8,
     region_used: usize,
+    regions: Vec<*mut u8>,
 }
 
 // The blocks are plain memory owned by the pool; readers only see shared slices after `finish`.
@@ -36,6 +37,7 @@ impl<T: Copy> Pool<T> {
             done: (0..parts).map(|_| Vec::new()).collect(),
             region: std::ptr::null_mut(),
             region_used: REGION,
+            regions: Vec::new(),
         }
     }
 
@@ -74,6 +76,7 @@ impl<T: Copy> Pool<T> {
         if self.region_used + BLOCK > REGION {
             self.region = map_huge(REGION);
             self.region_used = 0;
+            self.regions.push(self.region);
         }
         self.cur[p] = unsafe { self.region.add(self.region_used) } as *mut T;
         self.region_used += BLOCK;
@@ -98,6 +101,13 @@ impl<T: Copy> Pool<T> {
         unsafe {
             std::arch::x86_64::_mm_sfence()
         };
+    }
+
+    /// Gives the pool's memory back now, in the calling thread, instead of at exit on one core.
+    pub fn release(&self) {
+        for &r in &self.regions {
+            unsafe { madvise(r, REGION, 4) }; // MADV_DONTNEED
+        }
     }
 
     pub fn len(&self, p: usize) -> usize {
@@ -146,7 +156,9 @@ pub fn map_huge(len: usize) -> *mut u8 {
         let p = mmap(std::ptr::null_mut(), len + HUGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         assert!(p as isize != -1, "mmap failed");
         let aligned = p.add(p.align_offset(HUGE));
-        madvise(aligned, len, MADV_HUGEPAGE); // advisory: ignored where THP is off
+        if std::env::var_os("SS_NOHUGE").is_none() {
+            madvise(aligned, len, MADV_HUGEPAGE); // advisory: ignored where THP is off (SS_NOHUGE emulates that)
+        }
         aligned
     }
 }

@@ -233,7 +233,6 @@ fn main() {
         out.finish();
         out
     });
-    drop(evs);
     lap("dedup");
 
     // People per person partition, largest first; each worker writes its own user_daily file.
@@ -294,7 +293,12 @@ fn main() {
     let rows: usize = results.iter().map(|r| r.1).sum();
     let (cs, cr) = (c0.iter().sum::<i64>(), c2.iter().sum::<i64>());
     lap(&format!("write: {rows} user rows, {} campaign rows; sessions {cs}, revenue {cr}", days.len()));
-    // Nothing is freed: the kernel reclaims the gigabytes at exit faster than Rust drops them.
+    // Nothing is dropped; the big mappings are released on all threads so exit does not tear them down on one.
+    parallel(threads, |t| {
+        evs[t].release();
+        cks[t].release();
+        ev2[t].release();
+    });
     std::process::exit(0);
 }
 
