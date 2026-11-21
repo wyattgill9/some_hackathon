@@ -7,13 +7,71 @@
 //! its N unquoted fields, in order.
 use std::fs::File;
 use std::marker::PhantomData;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
+use crate::mem;
 use crate::parse;
 use crate::scan::{masks32, masks64};
 
 const TAIL: usize = 8 << 10;
+
+/// SS_MMAP: input files mapped once and read in place instead of copied by `pread`. 0 = pread (default);
+/// 1 = MADV_POPULATE_READ of each range before it is parsed (page tables filled in one call); 2 = MADV_WILLNEED
+/// per range; 3 = MADV_SEQUENTIAL on the whole file; anything else = a plain mapping (fault-around).
+fn mmap_mode() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| std::env::var("SS_MMAP").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+/// A mapped input file: `n` data bytes ending in a newline (one is written past the file's end when it had
+/// none), then at least 4 KiB of readable zeros up to `limit`.
+#[derive(Clone, Copy)]
+struct Map {
+    ptr: usize,
+    n: usize,
+    limit: usize,
+}
+
+static MAPS: Mutex<Vec<(i32, Map)>> = Mutex::new(Vec::new());
+
+/// The file's mapping under SS_MMAP, made on first use; None under pread, or for an empty file.
+fn mapped(file: &File) -> Option<Map> {
+    if mmap_mode() == 0 {
+        return None;
+    }
+    let fd = file.as_raw_fd();
+    let mut maps = MAPS.lock().unwrap();
+    if let Some((_, m)) = maps.iter().find(|(f, _)| *f == fd) {
+        return Some(*m);
+    }
+    let len = file.metadata().unwrap().len() as usize;
+    let (p, total) = mem::map_file(fd, len)?;
+    let mut n = len;
+    unsafe {
+        if *p.add(len - 1) != b'\n' {
+            *p.add(len) = b'\n'; // in the file's last page (copied on write) or the zeros after it
+            n += 1;
+        }
+    }
+    if mmap_mode() == 3 {
+        mem::advise(p, len, p.wrapping_add(total), mem::MADV_SEQUENTIAL);
+    }
+    let m = Map { ptr: p as usize, n, limit: p as usize + total };
+    maps.push((fd, m));
+    Some(m)
+}
+
+/// Thread `t` of `threads` gives back its share of every mapped input file's pages (the page cache keeps
+/// the data); nothing is then torn down at exit.
+pub fn release_maps(t: usize, threads: usize) {
+    for (_, m) in MAPS.lock().unwrap().iter() {
+        let (a, b) = (m.n * t / threads, m.n * (t + 1) / threads);
+        mem::release((m.ptr + a) as *mut u8, b - a);
+    }
+}
 /// Readable bytes after the data: the masks reach 128 bytes past a line start, value parsers 16 past a field.
 pub const PAD: usize = 128;
 
@@ -126,26 +184,41 @@ impl Reader {
     pub fn fields<const N: usize>(&mut self, file: &File, r: &Range, h: &mut impl Handler<N>) {
         let from = r.start.saturating_sub(1);
         let owned_end = (r.end - from) as usize; // data index of file offset r.end
-        let mut want = owned_end + TAIL;
-        let n = loop {
-            let (mut n, eof) = self.fill(file, from, want);
-            if eof {
-                if n == 0 {
-                    return;
-                }
-                if self.buf[n - 1] != b'\n' {
-                    self.buf[n] = b'\n'; // a missing final newline still ends the last line
-                    n += 1;
-                }
-                break n;
+        let (data, n): (&[u8], usize) = if let Some(m) = mapped(file) {
+            // SS_MMAP: the rest of the file, in place (the mapping keeps PAD readable bytes past its data).
+            let from = from as usize;
+            if from >= m.n {
+                return;
             }
-            // Every owned line ends inside the buffer iff some newline sits at or after owned_end - 1.
-            if self.buf[owned_end - 1..n].contains(&b'\n') {
-                break n;
+            let p = (m.ptr + from) as *const u8;
+            match mmap_mode() {
+                1 => mem::advise(p, owned_end + TAIL, m.limit as *const u8, mem::MADV_POPULATE_READ),
+                2 => mem::advise(p, owned_end + TAIL, m.limit as *const u8, mem::MADV_WILLNEED),
+                _ => {}
             }
-            want += TAIL;
+            (unsafe { std::slice::from_raw_parts(p, m.n - from + PAD) }, m.n - from)
+        } else {
+            let mut want = owned_end + TAIL;
+            let n = loop {
+                let (mut n, eof) = self.fill(file, from, want);
+                if eof {
+                    if n == 0 {
+                        return;
+                    }
+                    if self.buf[n - 1] != b'\n' {
+                        self.buf[n] = b'\n'; // a missing final newline still ends the last line
+                        n += 1;
+                    }
+                    break n;
+                }
+                // Every owned line ends inside the buffer iff some newline sits at or after owned_end - 1.
+                if self.buf[owned_end - 1..n].contains(&b'\n') {
+                    break n;
+                }
+                want += TAIL;
+            };
+            (&self.buf[..n + PAD], n)
         };
-        let data = &self.buf[..n + PAD];
         // The first owned line starts after the first newline at or after `from` (that skips the header at 0).
         let Some(first) = data[..n].iter().position(|&b| b == b'\n') else { return };
         let mut p = first + 1;

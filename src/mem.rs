@@ -55,6 +55,41 @@ pub fn populate(p: *mut u8, len: usize) {
     unsafe { madvise(start as *mut u8, end - start, MADV_POPULATE_WRITE) };
 }
 
+/// A private, writable mapping of a file's `len` bytes followed by at least 4 KiB of readable zeros (an
+/// anonymous reservation the file is mapped over), so reads may run past its end: (address, mapping size).
+/// None for an empty file, which cannot be mapped.
+pub fn map_file(fd: i32, len: usize) -> Option<(*mut u8, usize)> {
+    const PROT_RW: i32 = 3;
+    const MAP_PRIVATE: i32 = 2;
+    const MAP_FIXED: i32 = 0x10;
+    const MAP_ANONYMOUS: i32 = 0x20;
+    const MAP_NORESERVE: i32 = 0x4000;
+    if len == 0 {
+        return None;
+    }
+    let total = ((len + 4095) & !4095) + 4096;
+    unsafe {
+        let p = mmap(std::ptr::null_mut(), total, PROT_RW, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        assert!(p as isize != -1, "mmap failed");
+        let f = mmap(p, len, PROT_RW, MAP_PRIVATE | MAP_FIXED, fd, 0);
+        assert!(f == p, "mmap of an input file failed");
+        Some((p, total))
+    }
+}
+
+pub const MADV_SEQUENTIAL: i32 = 2;
+pub const MADV_WILLNEED: i32 = 3;
+pub const MADV_POPULATE_READ: i32 = 22; // Linux 5.14+
+
+/// `advice` for the whole pages touching `len` bytes at `p`, clamped to `limit` (the end of the mapping).
+pub fn advise(p: *const u8, len: usize, limit: *const u8, advice: i32) {
+    let start = p as usize & !4095;
+    let end = ((p as usize + len + 4095) & !4095).min(limit as usize);
+    if end > start {
+        unsafe { madvise(start as *mut u8, end - start, advice) };
+    }
+}
+
 /// Gives the whole pages of a range back now, in the calling thread, instead of at exit on one core.
 pub fn release(p: *mut u8, len: usize) {
     let start = (p as usize + 4095) & !4095;
