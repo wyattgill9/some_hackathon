@@ -6,6 +6,7 @@ mod links;
 mod parquet;
 mod parse;
 mod person;
+mod pool;
 mod reader;
 mod ts;
 mod u64map;
@@ -18,6 +19,7 @@ use std::time::Instant;
 use key::{Key, mix};
 use parquet::{Column, Kind};
 use person::Cell;
+use pool::Pool;
 use reader::{Range, Reader};
 use ts::TsCache;
 use u64map::U64Map;
@@ -156,64 +158,65 @@ fn main() {
     let mut tasks: Vec<(bool, Range)> = reader::ranges(&event_files, range).into_iter().map(|r| (true, r)).collect();
     tasks.extend(reader::ranges(&click_files, range).into_iter().map(|r| (false, r)));
     let next = AtomicUsize::new(0);
-    let est = (event_bytes / 85) as usize / threads / parts + 16;
-    let parsed: Vec<(Vec<Vec<Ev>>, Vec<Vec<Ck>>)> = parallel(threads, |_| {
+    let parsed: Vec<(Pool<Ev>, Pool<Ck>)> = parallel(threads, |_| {
         let (mut rd, mut tc) = (Reader::default(), TsCache::default());
-        let mut evs: Vec<Vec<Ev>> = (0..parts).map(|_| Vec::with_capacity(est)).collect();
-        let mut cks: Vec<Vec<Ck>> = (0..parts).map(|_| Vec::with_capacity(est / 4)).collect();
+        let (mut evs, mut cks) = (Pool::<Ev>::new(parts), Pool::<Ck>::new(parts));
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
-            let Some((is_event, r)) = tasks.get(i) else { break (evs, cks) };
+            let Some((is_event, r)) = tasks.get(i) else { break };
             if *is_event {
                 rd.lines(&event_files[r.file].0, r, |l| {
                     if let Some(e) = parse_event(l, &ctx, &cat_of, &links, &mut tc) {
-                        evs[(mix(e.eid) >> (64 - bits)) as usize].push(e);
+                        evs.push((mix(e.eid) >> (64 - bits)) as usize, e);
                     }
                 });
             } else {
                 rd.lines(&click_files[r.file].0, r, |l| {
                     if let Some(c) = parse_click(l, &ctx, &camp_of, &links, &mut tc) {
-                        cks[(mix(c.person) >> (64 - bits)) as usize].push(c);
+                        cks.push((mix(c.person) >> (64 - bits)) as usize, c);
                     }
                 });
             }
         }
+        evs.finish();
+        cks.finish();
+        (evs, cks)
     });
-    let (evs, cks): (Vec<Vec<Vec<Ev>>>, Vec<Vec<Vec<Ck>>>) = parsed.into_iter().unzip();
+    let (evs, cks): (Vec<Pool<Ev>>, Vec<Pool<Ck>>) = parsed.into_iter().unzip();
     lap("parse");
 
     // Dedup per event partition: keep the copy with the smallest ingest_ts, emit it if valid, by person.
     let next = AtomicUsize::new(0);
-    let ev2: Vec<Vec<Vec<Ev2>>> = parallel(threads, |_| {
+    let ev2: Vec<Pool<Ev2>> = parallel(threads, |_| {
         let (mut recs, mut tab) = (Vec::new(), Vec::new());
-        let mut out: Vec<Vec<Ev2>> = (0..parts).map(|_| Vec::new()).collect();
+        let mut out = Pool::<Ev2>::new(parts);
         loop {
             let p = next.fetch_add(1, Ordering::Relaxed);
             if p >= parts {
-                break out;
+                break;
             }
             recs.clear();
             for t in &evs {
-                recs.extend_from_slice(&t[p]);
+                t.blocks(p).for_each(|b| recs.extend_from_slice(b));
             }
             dedup(&recs, &mut tab, bits, &mut out);
         }
+        out.finish();
+        out
     });
     drop(evs);
     lap("dedup");
 
     // People per person partition, largest first; each worker writes its own user_daily file.
     let mut order: Vec<usize> = (0..parts).collect();
-    order.sort_by_key(|&q| std::cmp::Reverse(ev2.iter().map(|t| t[q].len()).sum::<usize>()));
+    order.sort_by_key(|&q| std::cmp::Reverse(ev2.iter().map(|t| t.len(q)).sum::<usize>()));
     let next = AtomicUsize::new(0);
     let results: Vec<(Vec<Cell>, usize)> = parallel(threads, |t| {
         let mut w = person::Worker::new(&ctx);
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             let Some(&q) = order.get(i) else { break };
-            let es: Vec<&[Ev2]> = ev2.iter().map(|v| v[q].as_slice()).collect();
-            let cs: Vec<&[Ck]> = cks.iter().map(|v| v[q].as_slice()).collect();
-            w.run(&es, &cs);
+            w.run(ev2.iter().flat_map(|t| t.blocks(q)), cks.iter().flat_map(|t| t.blocks(q)));
         }
         w.finish(&out.join("user_daily").join(format!("part-{t}.parquet")))
     });
@@ -319,7 +322,7 @@ fn parse_click(l: &[u8], ctx: &Ctx, camp_of: &U64Map, links: &links::Links, tc: 
 
 /// One event partition: an open-addressing table on the bits below the partition bits keeps, per event_id,
 /// the copy with the smallest ingest (the first seen on a tie: such copies are identical).
-fn dedup(recs: &[Ev], tab: &mut Vec<u32>, bits: u32, out: &mut [Vec<Ev2>]) {
+fn dedup(recs: &[Ev], tab: &mut Vec<u32>, bits: u32, out: &mut Pool<Ev2>) {
     if recs.is_empty() {
         return;
     }
@@ -349,7 +352,7 @@ fn dedup(recs: &[Ev], tab: &mut Vec<u32>, bits: u32, out: &mut [Vec<Ev2>]) {
         if s != 0 {
             let r = &recs[(s - 1) as usize];
             if r.flags & 1 == 1 {
-                out[(mix(r.person) >> (64 - bits)) as usize].push(Ev2 { person: r.person, ts: r.ts, pay: r.pay });
+                out.push((mix(r.person) >> (64 - bits)) as usize, Ev2 { person: r.person, ts: r.ts, pay: r.pay });
             }
         }
     }

@@ -121,7 +121,7 @@ impl<'a> Worker<'a> {
     }
 
     /// Processes one partition, given its events and clicks from every parse thread.
-    pub fn run(&mut self, evs: &[&[Ev2]], cks: &[&[Ck]]) {
+    pub fn run<'e, 'c>(&mut self, evs: impl Iterator<Item = &'e [Ev2]>, cks: impl Iterator<Item = &'c [Ck]>) {
         self.ev.clear();
         for s in evs {
             self.ev.extend_from_slice(s);
