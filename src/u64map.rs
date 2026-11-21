@@ -63,14 +63,6 @@ impl U64Map {
         self.vals[i]
     }
 
-    pub fn map_values(&mut self, f: impl Fn(u32) -> u32) {
-        for (k, v) in self.keys.iter().zip(self.vals.iter_mut()) {
-            if *k != 0 {
-                *v = f(*v);
-            }
-        }
-    }
-
     fn grow(&mut self) {
         let cap = self.keys.len() * 2;
         let old_keys = std::mem::replace(&mut self.keys, vec![0; cap]);
@@ -103,7 +95,5 @@ mod tests {
         assert_eq!(m.get(0), None);
         assert_eq!(m.get_or_insert_with(7, || 1), 1);
         assert_eq!(m.get_or_insert_with(7, || 2), 1);
-        m.map_values(|v| v + 1);
-        assert_eq!(m.get(7), Some(2));
     }
 }
