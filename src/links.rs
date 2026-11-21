@@ -1,17 +1,21 @@
 //! Linked IDs: a lock-free union-find over packed keys, each person named by its byte-wise smallest ID. A
 //! union always hangs the root with the larger key under the root with the smaller one, so every parent chain
 //! strictly decreases (no cycles, whatever the interleaving) and the root of a tree is the person's name. The
-//! result is a read-only open-addressing table from linked ID to name, 16 bytes per slot so a lookup costs
-//! one cache line, which callers prefetch ahead of time.
+//! result is a read-only table from linked ID to name in 64-byte lines of 4 IDs then their 4 names: a lookup
+//! reads one line, which callers prefetch ahead of time, compares the 4 IDs at once and takes the name without
+//! a branch; only a full line sends it on to the next.
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 
 use crate::key::{self, Key, mix};
 use crate::parallel;
 use crate::pool::map_huge;
 
+/// A table line: IDs (0 = empty) in `[0..4]`, their names in `[4..8]`.
+type Line = [u64; 8];
+
 pub struct Links {
-    table: &'static [[Key; 2]], // (id, name); id 0 = empty. Huge pages: lookups are random and prefetched.
-    mask: usize,
+    table: &'static [Line], // Huge pages: lookups are random and prefetched.
+    mask: usize,            // line index mask
 }
 
 /// A zeroed, huge-page-backed slice that lives until exit.
@@ -19,12 +23,23 @@ fn huge_slice<T>(n: usize) -> &'static mut [T] {
     unsafe { std::slice::from_raw_parts_mut(map_huge(n * std::mem::size_of::<T>()) as *mut T, n) }
 }
 
+#[inline(always)]
+fn prefetch(p: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(p as *const i8)
+    };
+}
+
 impl Links {
     pub fn build(edges: &[Vec<(Key, Key)>], threads: usize) -> Links {
         let n: usize = edges.iter().map(|e| e.len()).sum();
-        let cap = (n * 4).next_power_of_two().max(16); // at most 2 IDs per edge, at most half full
-        let mask = cap - 1;
-        let keys: &[AtomicU64] = huge_slice(cap); // zero = empty
+        let cap = (n * 4).next_power_of_two().max(16); // slots: at most 2 IDs per edge, at most half full
+        let lines = cap / 4;
+        let mask = lines - 1;
+        // The IDs go straight into the final table's lines (as atomics while the threads insert); the names
+        // half is filled at the end. Slot s = line s / 4, entry s % 4.
+        let table: &[[AtomicU64; 8]] = huge_slice(lines);
         let parent: &[AtomicU32] = huge_slice(cap);
         let chunk = cap.div_ceil(threads).max(1);
         parallel(threads, |t| {
@@ -32,14 +47,21 @@ impl Links {
                 parent[i].store(i as u32, Relaxed);
             }
         });
-        let slot = |k: Key| -> usize {
-            let mut s = (mix(k) >> 32) as usize & mask;
+        let key_at = |s: u32| table[s as usize / 4][s as usize % 4].load(Relaxed);
+        // The slot of `k`: the first entry of its home line (or the next ones) that takes it or already holds
+        // it. A key moves past a line only when all 4 entries hold other keys, and occupancy only grows, so a
+        // lookup that stops at the first line with an empty entry sees every key.
+        let slot = |k: Key| -> u32 {
+            let mut line = (mix(k) >> 32) as usize & mask;
             loop {
-                match keys[s].compare_exchange(0, k, Relaxed, Relaxed) {
-                    Ok(_) => return s,
-                    Err(cur) if cur == k => return s,
-                    Err(_) => s = (s + 1) & mask,
+                for (j, e) in table[line][..4].iter().enumerate() {
+                    match e.compare_exchange(0, k, Relaxed, Relaxed) {
+                        Ok(_) => return (line * 4 + j) as u32,
+                        Err(cur) if cur == k => return (line * 4 + j) as u32,
+                        Err(_) => {}
+                    }
                 }
+                line = (line + 1) & mask;
             }
         };
         let find = |mut x: u32| -> u32 {
@@ -57,24 +79,18 @@ impl Links {
         };
         // Edges go through in batches of 16: the key lines of the next batch and the parent lines of this
         // one are prefetched, so the table's cache misses overlap instead of stalling one by one.
-        let prefetch = |p: *const u8| {
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(p as *const i8)
-            };
-        };
         parallel(threads.min(edges.len().max(1)), |t| {
             let batches: Vec<&[(Key, Key)]> = edges[t].chunks(16).collect();
             let mut slots = [(0u32, 0u32); 16];
             for (i, batch) in batches.iter().enumerate() {
                 if let Some(next) = batches.get(i + 1) {
                     for &(a, b) in *next {
-                        prefetch(keys[(mix(a) >> 32) as usize & mask].as_ptr() as *const u8);
-                        prefetch(keys[(mix(b) >> 32) as usize & mask].as_ptr() as *const u8);
+                        prefetch(table[(mix(a) >> 32) as usize & mask].as_ptr() as *const u8);
+                        prefetch(table[(mix(b) >> 32) as usize & mask].as_ptr() as *const u8);
                     }
                 }
                 for (j, &(a, b)) in batch.iter().enumerate() {
-                    let (sa, sb) = (slot(a) as u32, slot(b) as u32);
+                    let (sa, sb) = (slot(a), slot(b));
                     prefetch(parent[sa as usize].as_ptr() as *const u8);
                     prefetch(parent[sb as usize].as_ptr() as *const u8);
                     slots[j] = (sa, sb);
@@ -85,7 +101,7 @@ impl Links {
                         if ra == rb {
                             break;
                         }
-                        let (ka, kb) = (keys[ra as usize].load(Relaxed), keys[rb as usize].load(Relaxed));
+                        let (ka, kb) = (key_at(ra), key_at(rb));
                         let (lo, hi) = if key::cmp(ka, kb).is_lt() { (ra, rb) } else { (rb, ra) };
                         if parent[hi as usize].compare_exchange(hi, lo, Relaxed, Relaxed).is_ok() {
                             break;
@@ -94,55 +110,64 @@ impl Links {
                 }
             }
         });
-        let table: &'static mut [[Key; 2]] = huge_slice(cap);
-        std::thread::scope(|s| {
-            for (c, out) in table.chunks_mut(chunk).enumerate() {
-                let (keys, find) = (&keys, &find);
-                s.spawn(move || {
-                    for (i, o) in out.iter_mut().enumerate() {
-                        let k = keys[c * chunk + i].load(Relaxed);
-                        if k != 0 {
-                            *o = [k, keys[find((c * chunk + i) as u32) as usize].load(Relaxed)];
-                        }
+        // Names: each thread fills the lines of its chunk (the keys and parents it reads are final now).
+        let lchunk = lines.div_ceil(threads).max(1);
+        parallel(threads, |t| {
+            for line in t * lchunk..((t + 1) * lchunk).min(lines) {
+                for j in 0..4 {
+                    let s = (line * 4 + j) as u32;
+                    if key_at(s) != 0 {
+                        table[line][4 + j].store(key_at(find(s)), Relaxed);
                     }
-                });
+                }
             }
         });
+        // Every thread's writes are complete (joined); the atomics are read as plain words from here on.
+        let table: &'static [Line] = unsafe { std::slice::from_raw_parts(table.as_ptr() as *const Line, lines) };
         Links { table, mask }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn prefetch(&self, k: Key) {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-            let s = (mix(k) >> 32) as usize & self.mask;
-            _mm_prefetch::<_MM_HINT_T0>(self.table.as_ptr().add(s) as *const i8);
-        }
+        prefetch(self.table[(mix(k) >> 32) as usize & self.mask].as_ptr() as *const u8);
     }
 
-    /// The person's name: the root of a linked ID, or the ID itself.
-    #[inline]
+    /// The person's name: the root of a linked ID, or the ID itself. Whether an ID is linked is a coin toss
+    /// per line, so the usual line is resolved without a branch on it.
+    #[inline(always)]
     pub fn lookup(&self, k: Key) -> Key {
-        if k == 0 {
-            return 0;
-        }
-        let mut s = (mix(k) >> 32) as usize & self.mask;
-        // Whether the ID is linked is a coin toss per line: the first slot is resolved without a branch on it.
-        let [id, name] = self.table[s];
-        if id == k || id == 0 {
-            return std::hint::select_unpredictable(id == k, name, k);
-        }
+        let mut line = (mix(k) >> 32) as usize & self.mask;
         loop {
-            s = (s + 1) & self.mask;
-            let [id, name] = self.table[s];
-            if id == k {
-                return name;
+            let l = &self.table[line];
+            let (hit, empty) = matches(l, k);
+            // Entry 0..=3 of a hit, else any entry: the name is taken either way and chosen afterwards.
+            let name = l[4 + ((hit | 16).trailing_zeros() as usize & 3)];
+            if hit | empty != 0 {
+                return std::hint::select_unpredictable(hit != 0, name, k);
             }
-            if id == 0 {
-                return k;
-            }
+            line = (line + 1) & self.mask;
         }
+    }
+}
+
+/// Bit j set where entry j of the line holds `k`, and where it is empty.
+#[inline(always)]
+fn matches(l: &Line, k: Key) -> (u32, u32) {
+    #[cfg(target_feature = "avx2")]
+    unsafe {
+        use std::arch::x86_64::*;
+        let keys = _mm256_loadu_si256(l.as_ptr() as *const __m256i);
+        let m = |v: __m256i| _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(keys, v))) as u32;
+        (m(_mm256_set1_epi64x(k as i64)), m(_mm256_setzero_si256()))
+    }
+    #[cfg(not(target_feature = "avx2"))]
+    {
+        let (mut hit, mut empty) = (0, 0);
+        for j in 0..4 {
+            hit |= ((l[j] == k) as u32) << j;
+            empty |= ((l[j] == 0) as u32) << j;
+        }
+        (hit, empty)
     }
 }
 
@@ -190,6 +215,7 @@ mod tests {
             assert_eq!(links.lookup(p(&format!("u{i}"))), p("A\tB"));
         }
         assert_eq!(links.lookup(p("zzz")), p("zzz"));
+        assert_eq!(links.lookup(0), 0);
         let links = Links::build(&[vec![(p("u3"), p("u9")), (p("u9"), p("u2"))], vec![(p("U7"), p("u9"))]], 2);
         assert_eq!(links.lookup(p("u2")), p("U7"));
         assert_eq!(links.lookup(p("u3")), p("U7"));
@@ -223,6 +249,11 @@ mod tests {
                 let links = Links::build(&per, threads);
                 for &(id, name) in &want {
                     assert_eq!(links.lookup(id), name, "threads {threads}");
+                }
+                // IDs that are not linked name themselves, through full and partly filled lines alike.
+                for i in 0..5000 {
+                    let k = key::pack(format!("x{i}").as_bytes());
+                    assert_eq!(links.lookup(k), k);
                 }
             }
         }
