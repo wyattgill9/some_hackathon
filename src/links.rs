@@ -105,7 +105,13 @@ impl Links {
             return 0;
         }
         let mut s = (mix(k) >> 32) as usize & self.mask;
+        // Whether the ID is linked is a coin toss per line: the first slot is resolved without a branch on it.
+        let [id, name] = self.table[s];
+        if id == k || id == 0 {
+            return std::hint::select_unpredictable(id == k, name, k);
+        }
         loop {
+            s = (s + 1) & self.mask;
             let [id, name] = self.table[s];
             if id == k {
                 return name;
@@ -113,7 +119,6 @@ impl Links {
             if id == 0 {
                 return k;
             }
-            s = (s + 1) & self.mask;
         }
     }
 }

@@ -5,7 +5,8 @@
 pub struct Index {
     pub delims: Vec<u32>, // commas and newlines, in order
     pub nl: Vec<u32>,
-    pub quotes: Vec<u32>,
+    qmask: Vec<u64>,   // per 64-byte block: the quote bits
+    qprefix: Vec<u32>, // per block: quotes before it
 }
 
 pub const SENTINELS: usize = 16;
@@ -16,22 +17,35 @@ impl Index {
         assert!(buf.len() >= n + 64);
         self.delims.clear();
         self.nl.clear();
-        self.quotes.clear();
+        self.qmask.clear();
+        self.qprefix.clear();
         self.delims.reserve(n / 6 + SENTINELS);
         self.nl.reserve(n / 32 + 1);
-        self.quotes.reserve(n / 32 + 1);
-        let mut o = 0;
+        self.qmask.reserve(n / 64 + 1);
+        self.qprefix.reserve(n / 64 + 1);
+        let (mut o, mut quotes) = (0, 0u32);
         while o < n {
             let (d, l, q) = masks(&buf[o..o + 64]);
             let valid = if n - o >= 64 { u64::MAX } else { (1u64 << (n - o)) - 1 };
             flatten::<12>(d & valid, o, &mut self.delims);
             flatten::<4>(l & valid, o, &mut self.nl);
-            flatten::<4>(q & valid, o, &mut self.quotes);
+            self.qmask.push(q & valid);
+            self.qprefix.push(quotes);
+            quotes += (q & valid).count_ones();
             o += 64;
         }
         self.delims.extend(std::iter::repeat_n(u32::MAX, SENTINELS));
         self.nl.push(u32::MAX);
-        self.quotes.push(u32::MAX);
+    }
+
+    /// The number of quotes in `buf[..pos]`, for `pos` within the indexed data.
+    #[inline(always)]
+    pub fn quotes_before(&self, pos: usize) -> u32 {
+        // In bounds: pos < n, and both arrays hold an entry per 64-byte block of the data.
+        unsafe {
+            let (b, i) = (pos >> 6, pos & 63);
+            *self.qprefix.get_unchecked(b) + (*self.qmask.get_unchecked(b) & ((1u64 << i) - 1)).count_ones()
+        }
     }
 }
 
@@ -102,7 +116,9 @@ mod tests {
         idx.build(&data, n);
         let want = |c: u8| -> Vec<u32> { (0..n).filter(|&i| data[i] == c).map(|i| i as u32).collect() };
         assert_eq!(&idx.nl[..idx.nl.len() - 1], want(b'\n'));
-        assert_eq!(&idx.quotes[..idx.quotes.len() - 1], want(b'"'));
+        for pos in 0..n {
+            assert_eq!(idx.quotes_before(pos) as usize, data[..pos].iter().filter(|&&c| c == b'"').count(), "{pos}");
+        }
         let mut d: Vec<u32> = want(b',');
         d.extend(want(b'\n'));
         d.sort_unstable();

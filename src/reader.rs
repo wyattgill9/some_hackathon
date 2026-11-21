@@ -88,15 +88,13 @@ impl Reader {
         let (buf, idx) = (&self.buf[..], &self.index);
         let mut k = idx.nl.partition_point(|&x| (x as usize) < pos);
         let mut d = idx.delims.partition_point(|&x| (x as usize) < pos) - 1; // the newline at pos - 1
-        let mut qi = idx.quotes.partition_point(|&x| (x as usize) < pos);
         let mut start = pos;
+        let mut quotes_at_start = idx.quotes_before(start);
         while start < owned_end {
             let end = idx.nl[k] as usize;
-            let mut quotes = 0;
-            while (idx.quotes[qi] as usize) < end {
-                quotes += 1;
-                qi += 1;
-            }
+            let quotes_at_end = idx.quotes_before(end);
+            let quotes = quotes_at_end - quotes_at_start;
+            quotes_at_start = quotes_at_end;
             if idx.delims[d + N] as usize == end {
                 let mut out = [&buf[..0]; N];
                 let mut wrapped = 0;
@@ -110,7 +108,7 @@ impl Reader {
                         *o = buf.get_unchecked(a + w..b - w);
                     }
                 }
-                if quotes == 2 * wrapped {
+                if quotes as usize == 2 * wrapped {
                     f(out);
                 }
                 d += N;
