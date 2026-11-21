@@ -3,7 +3,86 @@
 //! strings DELTA_LENGTH_BYTE_ARRAY or PLAIN. Just enough for the two output tables; `scripts/check_parquet.py`
 //! reads the result back with polars, pyarrow and duckdb.
 use std::io::{IoSlice, Write};
+use std::mem::size_of;
 use std::path::Path;
+
+use crate::mem;
+
+/// A column on huge-page-advised memory: `cap` values reserved (virtual), populated ahead of use in
+/// `STEP`-byte pieces where huge pages are off. Pushes are unchecked: `reserve` runs once per partition for
+/// the partition's worst case, and only then can the buffer grow (a remap).
+pub struct Buf<T: Copy> {
+    p: *mut T,
+    len: usize,
+    cap: usize,
+    ready: usize,
+}
+
+const STEP: usize = 512 << 10;
+
+impl<T: Copy> Buf<T> {
+    pub fn new(cap: usize) -> Self {
+        let cap = cap.max(4096);
+        Buf { p: mem::map_huge(cap * size_of::<T>()).cast(), len: 0, cap, ready: 0 }
+    }
+    /// Room for `n` more values, faulted in.
+    pub fn reserve(&mut self, n: usize) {
+        if self.len + n > self.cap {
+            self.grow(self.len + n);
+        }
+        let need = (self.len + n) * size_of::<T>();
+        if need > self.ready {
+            let to = ((need + STEP - 1) & !(STEP - 1)).min(self.cap * size_of::<T>());
+            mem::populate(unsafe { self.p.cast::<u8>().add(self.ready) }, to - self.ready);
+            self.ready = to;
+        }
+    }
+    #[cold]
+    fn grow(&mut self, min: usize) {
+        let cap = (self.cap * 2).max(min);
+        let p: *mut T = mem::map_huge(cap * size_of::<T>()).cast();
+        unsafe { std::ptr::copy_nonoverlapping(self.p, p, self.len) };
+        mem::release(self.p.cast(), self.cap * size_of::<T>());
+        (self.p, self.cap, self.ready) = (p, cap, (self.len * size_of::<T>()) & !(STEP - 1));
+    }
+    #[inline(always)]
+    pub fn push(&mut self, v: T) {
+        debug_assert!(self.len < self.cap);
+        unsafe { *self.p.add(self.len) = v };
+        self.len += 1;
+    }
+    #[inline(always)]
+    pub fn extend(&mut self, v: &[T]) {
+        debug_assert!(self.len + v.len() <= self.cap);
+        unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), self.p.add(self.len), v.len()) };
+        self.len += v.len();
+    }
+    #[inline(always)]
+    pub fn last_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.p.add(self.len - 1) }
+    }
+    pub fn as_slice(&self) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.p, self.len) }
+    }
+}
+
+impl Buf<u8> {
+    /// Appends `len <= 16` bytes from a padded copy with one store (room for 16 was reserved).
+    #[inline(always)]
+    pub fn put16(&mut self, v: [u8; 16], len: usize) {
+        debug_assert!(self.len + 16 <= self.cap);
+        unsafe { self.p.add(self.len).cast::<[u8; 16]>().write_unaligned(v) };
+        self.len += len;
+    }
+}
+
+impl<T: Copy> Drop for Buf<T> {
+    fn drop(&mut self) {
+        mem::release(self.p.cast(), self.cap * size_of::<T>());
+    }
+}
+
+
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Kind {
@@ -55,9 +134,11 @@ pub fn def_levels(bits: &[u8], n: usize) -> Vec<u8> {
     out
 }
 /// DELTA_BINARY_PACKED: blocks of 128 deltas in 4 miniblocks of 32, each bit-packed at its own width.
-pub fn delta<T: Copy + Into<i64>>(vals: &[T]) -> Vec<u8> {
+pub fn delta<T: Copy + Into<i64>>(vals: &[T]) -> Buf<u8> {
     let n = vals.len();
-    let mut out = Vec::with_capacity(n * 2 + 16);
+    // Worst case 8 bytes a value plus 14 of block header per 128 values; populated as written.
+    let mut out = Buf::new(n * 8 + n / 128 * 14 + 64);
+    out.reserve(32);
     varint(&mut out, 128);
     varint(&mut out, 4);
     varint(&mut out, n as u64);
@@ -67,6 +148,7 @@ pub fn delta<T: Copy + Into<i64>>(vals: &[T]) -> Vec<u8> {
     let mut i = 1;
     while i < n {
         let chunk = &vals[i..n.min(i + 128)];
+        out.reserve(128 * 8 + 14);
         let mut blk = [0i64; 128];
         let mut min = i64::MAX;
         for (b, &v) in blk.iter_mut().zip(chunk) {
@@ -86,7 +168,7 @@ pub fn delta<T: Copy + Into<i64>>(vals: &[T]) -> Vec<u8> {
         for (m, w) in widths.iter_mut().enumerate().take(used) {
             *w = (64 - u[m * 32..m * 32 + 32].iter().fold(0, |a, &x| a | x).leading_zeros()) as u8;
         }
-        out.extend_from_slice(&widths);
+        out.extend(&widths);
         for (m, &w) in widths.iter().enumerate().take(used) {
             pack32(&mut out, &u[m * 32..m * 32 + 32], w as u32);
         }
@@ -96,18 +178,17 @@ pub fn delta<T: Copy + Into<i64>>(vals: &[T]) -> Vec<u8> {
 }
 
 /// 32 values bit-packed LSB first at width `w`: exactly `4 * w` bytes.
-fn pack32(out: &mut Vec<u8>, v: &[u64], w: u32) {
+fn pack32(out: &mut Buf<u8>, v: &[u64], w: u32) {
     if w == 0 {
         return;
     }
-    out.reserve(4 * w as usize);
     if w <= 32 {
         let (mut acc, mut bits) = (0u64, 0);
         for &x in v {
             acc |= x << bits;
             bits += w;
             if bits >= 32 {
-                out.extend_from_slice(&(acc as u32).to_le_bytes());
+                out.extend(&(acc as u32).to_le_bytes());
                 acc >>= 32;
                 bits -= 32;
             }
@@ -118,7 +199,7 @@ fn pack32(out: &mut Vec<u8>, v: &[u64], w: u32) {
             acc |= (x as u128) << bits;
             bits += w;
             while bits >= 32 {
-                out.extend_from_slice(&(acc as u32).to_le_bytes());
+                out.extend(&(acc as u32).to_le_bytes());
                 acc >>= 32;
                 bits -= 32;
             }
@@ -126,15 +207,32 @@ fn pack32(out: &mut Vec<u8>, v: &[u64], w: u32) {
     }
 }
 
-fn varint(out: &mut Vec<u8>, mut v: u64) {
-    while v >= 0x80 {
-        out.push(v as u8 | 0x80);
-        v >>= 7;
+/// A byte sink: `Vec<u8>` for the metadata, `Buf<u8>` for the page bodies.
+trait Bytes {
+    fn byte(&mut self, b: u8);
+}
+impl Bytes for Vec<u8> {
+    #[inline(always)]
+    fn byte(&mut self, b: u8) {
+        self.push(b);
     }
-    out.push(v as u8);
+}
+impl Bytes for Buf<u8> {
+    #[inline(always)]
+    fn byte(&mut self, b: u8) {
+        self.push(b);
+    }
 }
 
-fn zigzag(out: &mut Vec<u8>, v: i64) {
+fn varint(out: &mut impl Bytes, mut v: u64) {
+    while v >= 0x80 {
+        out.byte(v as u8 | 0x80);
+        v >>= 7;
+    }
+    out.byte(v as u8);
+}
+
+fn zigzag(out: &mut impl Bytes, v: i64) {
     varint(out, ((v << 1) ^ (v >> 63)) as u64);
 }
 
@@ -353,12 +451,12 @@ mod tests {
             );
             let def = def_levels(&bits, rows);
             let user = [
-                Column { name: "user_id", kind: Kind::Str, enc: Enc::Delta, optional: false, parts: &[&idl, &idbytes] },
-                Column { name: "day", kind: Kind::Date, enc: Enc::Delta, optional: false, parts: &[&dayd] },
-                Column { name: "sessions", kind: Kind::Int32, enc: Enc::Delta, optional: false, parts: &[&sessd] },
+                Column { name: "user_id", kind: Kind::Str, enc: Enc::Delta, optional: false, parts: &[idl.as_slice(), &idbytes] },
+                Column { name: "day", kind: Kind::Date, enc: Enc::Delta, optional: false, parts: &[dayd.as_slice()] },
+                Column { name: "sessions", kind: Kind::Int32, enc: Enc::Delta, optional: false, parts: &[sessd.as_slice()] },
                 Column { name: "events", kind: Kind::Int32, enc: Enc::Plain, optional: false, parts: &[plain(&sess)] },
-                Column { name: "revenue_cents", kind: Kind::Int64, enc: Enc::Delta, optional: false, parts: &[&revd] },
-                Column { name: "top_category", kind: Kind::Str, enc: Enc::Delta, optional: true, parts: &[&def, &topl, &topbytes] },
+                Column { name: "revenue_cents", kind: Kind::Int64, enc: Enc::Delta, optional: false, parts: &[revd.as_slice()] },
+                Column { name: "top_category", kind: Kind::Str, enc: Enc::Delta, optional: true, parts: &[&def, topl.as_slice(), &topbytes] },
             ];
             let camp = [
                 Column { name: "campaign_id", kind: Kind::Str, enc: Enc::Plain, optional: false, parts: &[&ids] },

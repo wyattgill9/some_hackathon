@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::key::{self, Key};
 use crate::mem;
-use crate::parquet::{self, Column, Enc, Kind};
+use crate::parquet::{self, Buf, Column, Enc, Kind};
 use crate::{Ck, Ctx, DAY, Ev2, GAP, WEEK};
 
 const NONE: u32 = u32::MAX;
@@ -35,18 +35,47 @@ struct Credit {
 }
 
 /// user_daily rows as columns: strings as lengths and bytes, `present` as packed bits.
-#[derive(Default)]
 pub struct Rows {
     pub n: usize,
-    idlen: Vec<i32>,
-    idbytes: Vec<u8>,
-    day: Vec<i32>,
-    sessions: Vec<i32>,
-    events: Vec<i32>,
-    revenue: Vec<i64>,
-    present: Vec<u8>,
-    toplen: Vec<i32>,
-    topbytes: Vec<u8>,
+    idlen: Buf<i32>,
+    idbytes: Buf<u8>,
+    day: Buf<i32>,
+    sessions: Buf<i32>,
+    events: Buf<i32>,
+    revenue: Buf<i64>,
+    present: Buf<u8>,
+    toplen: Buf<i32>,
+    topbytes: Buf<u8>,
+}
+
+impl Rows {
+    /// Columns reserved for about `rows` rows (virtual; they grow past it).
+    fn new(rows: usize) -> Self {
+        Rows {
+            n: 0,
+            idlen: Buf::new(rows),
+            idbytes: Buf::new(rows * 10),
+            day: Buf::new(rows),
+            sessions: Buf::new(rows),
+            events: Buf::new(rows),
+            revenue: Buf::new(rows),
+            present: Buf::new(rows / 8 + 1),
+            toplen: Buf::new(rows),
+            topbytes: Buf::new(rows * 10),
+        }
+    }
+    /// Room for `n` more rows whose strings are at most 16 bytes (longer ones reserve as they go).
+    fn reserve(&mut self, n: usize) {
+        self.idlen.reserve(n);
+        self.idbytes.reserve(n * 16);
+        self.day.reserve(n);
+        self.sessions.reserve(n);
+        self.events.reserve(n);
+        self.revenue.reserve(n);
+        self.present.reserve(n / 8 + 1);
+        self.toplen.reserve(n);
+        self.topbytes.reserve(n * 16);
+    }
 }
 
 /// A session: start in ms from `cws`, day index, purchase revenue.
@@ -115,7 +144,8 @@ pub struct Worker<'a> {
 }
 
 impl<'a> Worker<'a> {
-    pub fn new(ctx: &'a Ctx) -> Self {
+    /// `rows` is the worker's expected share of user_daily rows (an upper estimate; only virtual space).
+    pub fn new(ctx: &'a Ctx, rows: usize) -> Self {
         Worker {
             ctx,
             nbins: ((ctx.we - ctx.cws) >> BIN) as usize + 2,
@@ -149,7 +179,7 @@ impl<'a> Worker<'a> {
                 buf: Vec::new(),
                 id: [0; 16],
                 cat16: ctx.cats.iter().map(|c| { let mut a = [0; 16]; for (d, &s) in a.iter_mut().zip(c) { *d = s; } a }).collect(),
-                rows: Rows::default(),
+                rows: Rows::new(rows),
                 // Written pages, not calloc: these are read-modify-written, and a calloc page read first
                 // maps the zero page, whose copy-on-write flushes every thread's TLB.
                 cells: mem::zeroed::<Credit>((ctx.ncamp + 1) * ctx.ndays),
@@ -167,6 +197,7 @@ impl<'a> Worker<'a> {
             return;
         }
         let cblocks: Vec<&[Ck]> = cks.collect();
+        self.out.rows.reserve(n); // at most one row per event
         // Events are never sorted: a counting sort by bin, then a stable one by person, leaves each person's
         // events in bin order, which is all the session walk needs. The bin scatter also builds the local
         // index (person key -> dense local id; clicks only look up) and tags each record with its id. A table
@@ -384,7 +415,11 @@ impl<'a> Worker<'a> {
         let cells = self.out.cells.iter().zip(assisted).map(|(c, a)| Cell { sessions: c.sessions, purchasing: c.purchasing, assisted: a, revenue: c.revenue }).collect();
         let r = self.out.rows;
         let d = parquet::delta::<i32>;
-        let enc = [d(&r.idlen), d(&r.day), d(&r.sessions), d(&r.events), parquet::delta(&r.revenue), parquet::def_levels(&r.present, r.n), d(&r.toplen)];
+        let def = parquet::def_levels(r.present.as_slice(), r.n);
+        let mut defb = Buf::new(def.len());
+        defb.reserve(def.len());
+        defb.extend(&def);
+        let enc = [d(r.idlen.as_slice()), d(r.day.as_slice()), d(r.sessions.as_slice()), d(r.events.as_slice()), parquet::delta(r.revenue.as_slice()), defb, d(r.toplen.as_slice())];
         (cells, r.n, UserFile { rows: r, enc })
     }
 }
@@ -392,19 +427,19 @@ impl<'a> Worker<'a> {
 /// A worker's user_daily table, encoded: the delta bodies of the integer and length columns, the string bytes.
 pub struct UserFile {
     rows: Rows,
-    enc: [Vec<u8>; 7],
+    enc: [Buf<u8>; 7],
 }
 
 impl UserFile {
     pub fn write(&self, path: &Path) {
         let (r, [idl, day, sess, ev, rev, def, topl]) = (&self.rows, &self.enc);
         let cols = [
-            Column { name: "user_id", kind: Kind::Str, enc: Enc::Delta, optional: false, parts: &[idl, &r.idbytes] },
-            Column { name: "day", kind: Kind::Date, enc: Enc::Delta, optional: false, parts: &[day] },
-            Column { name: "sessions", kind: Kind::Int32, enc: Enc::Delta, optional: false, parts: &[sess] },
-            Column { name: "events", kind: Kind::Int32, enc: Enc::Delta, optional: false, parts: &[ev] },
-            Column { name: "revenue_cents", kind: Kind::Int64, enc: Enc::Delta, optional: false, parts: &[rev] },
-            Column { name: "top_category", kind: Kind::Str, enc: Enc::Delta, optional: true, parts: &[def, topl, &r.topbytes] },
+            Column { name: "user_id", kind: Kind::Str, enc: Enc::Delta, optional: false, parts: &[idl.as_slice(), r.idbytes.as_slice()] },
+            Column { name: "day", kind: Kind::Date, enc: Enc::Delta, optional: false, parts: &[day.as_slice()] },
+            Column { name: "sessions", kind: Kind::Int32, enc: Enc::Delta, optional: false, parts: &[sess.as_slice()] },
+            Column { name: "events", kind: Kind::Int32, enc: Enc::Delta, optional: false, parts: &[ev.as_slice()] },
+            Column { name: "revenue_cents", kind: Kind::Int64, enc: Enc::Delta, optional: false, parts: &[rev.as_slice()] },
+            Column { name: "top_category", kind: Kind::Str, enc: Enc::Delta, optional: true, parts: &[def.as_slice(), topl.as_slice(), r.topbytes.as_slice()] },
         ];
         parquet::write(path, r.n, &cols).unwrap();
     }
@@ -518,7 +553,8 @@ fn flush(ctx: &Ctx, o: &mut Out, day: i32, sessions: u32, events: u32, rev: i64)
     if o.buf.len() <= 16 {
         put16(&mut r.idbytes, o.id, o.buf.len());
     } else {
-        r.idbytes.extend_from_slice(&o.buf);
+        r.idbytes.reserve(o.buf.len());
+        r.idbytes.extend(&o.buf);
     }
     r.day.push(day);
     r.sessions.push(sessions as i32);
@@ -527,27 +563,24 @@ fn flush(ctx: &Ctx, o: &mut Out, day: i32, sessions: u32, events: u32, rev: i64)
     if r.n % 8 == 0 {
         r.present.push(0);
     }
-    *r.present.last_mut().unwrap() |= ((top != NONE) as u8) << (r.n % 8);
+    *r.present.last_mut() |= ((top != NONE) as u8) << (r.n % 8);
     if top != NONE {
         let c = &ctx.cats[top as usize];
         r.toplen.push(c.len() as i32);
         if c.len() <= 16 {
             put16(&mut r.topbytes, o.cat16[top as usize], c.len());
         } else {
-            r.topbytes.extend_from_slice(c);
+            r.topbytes.reserve(c.len());
+            r.topbytes.extend(c);
         }
     }
     r.n += 1;
 }
 
-/// Appends `len <= 16` bytes from a padded copy with one store.
+/// Appends `len <= 16` bytes from a padded copy with one store (room for 16 was reserved).
 #[inline(always)]
-fn put16(out: &mut Vec<u8>, v: [u8; 16], len: usize) {
-    out.reserve(16);
-    unsafe {
-        out.as_mut_ptr().add(out.len()).cast::<[u8; 16]>().write_unaligned(v);
-        out.set_len(out.len() + len);
-    }
+fn put16(out: &mut Buf<u8>, v: [u8; 16], len: usize) {
+    out.put16(v, len);
 }
 
 /// Credit each session to the latest click in [start - 7d, start] (ties: smallest click_id, which sorts last),

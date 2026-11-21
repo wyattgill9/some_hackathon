@@ -238,15 +238,17 @@ fn main() {
 
     // People per person partition, largest first; each worker writes its own user_daily file. Its cells and
     // row count go to the main thread first, which writes campaign_daily while the user files are written.
+    let sizes: Vec<usize> = (0..parts).map(|q| ev2.iter().map(|t| t.len(q)).sum()).collect();
+    let share = sizes.iter().sum::<usize>() / threads;
     let mut order: Vec<usize> = (0..parts).collect();
-    order.sort_by_key(|&q| std::cmp::Reverse(ev2.iter().map(|t| t.len(q)).sum::<usize>()));
+    order.sort_by_key(|&q| std::cmp::Reverse(sizes[q]));
     let next = AtomicUsize::new(0);
     let (tx, rx) = std::sync::mpsc::channel::<(Vec<Cell>, usize)>();
     let (rows, cs, cr, nrows) = std::thread::scope(|s| {
         for t in 0..threads {
             let (tx, ctx, out, ev2, cks, order, next) = (tx.clone(), &ctx, &out, &ev2, &cks, &order, &next);
             s.spawn(move || {
-                let mut w = person::Worker::new(ctx);
+                let mut w = person::Worker::new(ctx, share / 4 + share / 8);
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(&q) = order.get(i) else { break };
