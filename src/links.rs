@@ -7,10 +7,16 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 
 use crate::key::{self, Key, mix};
 use crate::parallel;
+use crate::pool::map_huge;
 
 pub struct Links {
-    table: Vec<[Key; 2]>, // (id, name); id 0 = empty
+    table: &'static [[Key; 2]], // (id, name); id 0 = empty. Huge pages: lookups are random and prefetched.
     mask: usize,
+}
+
+/// A zeroed, huge-page-backed slice that lives until exit.
+fn huge_slice<T>(n: usize) -> &'static mut [T] {
+    unsafe { std::slice::from_raw_parts_mut(map_huge(n * std::mem::size_of::<T>()) as *mut T, n) }
 }
 
 impl Links {
@@ -18,8 +24,14 @@ impl Links {
         let n: usize = edges.iter().map(|e| e.len()).sum();
         let cap = (n * 4).next_power_of_two().max(16); // at most 2 IDs per edge, at most half full
         let mask = cap - 1;
-        let keys: Vec<AtomicU64> = (0..cap).map(|_| AtomicU64::new(0)).collect();
-        let parent: Vec<AtomicU32> = (0..cap).map(|i| AtomicU32::new(i as u32)).collect();
+        let keys: &[AtomicU64] = huge_slice(cap); // zero = empty
+        let parent: &[AtomicU32] = huge_slice(cap);
+        let chunk = cap.div_ceil(threads).max(1);
+        parallel(threads, |t| {
+            for i in t * chunk..((t + 1) * chunk).min(cap) {
+                parent[i].store(i as u32, Relaxed);
+            }
+        });
         let slot = |k: Key| -> usize {
             let mut s = (mix(k) >> 32) as usize & mask;
             loop {
@@ -59,8 +71,7 @@ impl Links {
                 }
             }
         });
-        let mut table = vec![[0 as Key; 2]; cap];
-        let chunk = cap.div_ceil(threads).max(1);
+        let table: &'static mut [[Key; 2]] = huge_slice(cap);
         std::thread::scope(|s| {
             for (c, out) in table.chunks_mut(chunk).enumerate() {
                 let (keys, find) = (&keys, &find);

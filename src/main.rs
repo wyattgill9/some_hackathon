@@ -359,9 +359,10 @@ fn parse_event([id, user, ts, ingest, kind, product, price]: [&[u8]; 7], ctx: &C
     if id.is_empty() {
         return false;
     }
-    let t = tc.parse(ts).filter(|t| (ctx.ws..ctx.we).contains(t));
+    // Fields point into the reader's buffer, which keeps 64 readable bytes past the data.
+    let t = unsafe { tc.parse_raw(ts.as_ptr(), ts.len()) }.filter(|t| (ctx.ws..ctx.we).contains(t));
     // ponytail: rules.md guarantees ingest_ts is valid F1; a bad one sorts last and fails the late check.
-    let ing = tc.parse(ingest).unwrap_or(i64::MAX);
+    let ing = unsafe { tc.parse_raw(ingest.as_ptr(), ingest.len()) }.unwrap_or(i64::MAX);
     let mut valid = !user.is_empty()
         && !product.is_empty()
         && matches!(kind, b"view" | b"cart" | b"purchase")
@@ -388,7 +389,7 @@ fn parse_click([id, user, camp, ts]: [&[u8]; 4], ctx: &Ctx, camp_of: &U64Map, tc
     if id.is_empty() || user.is_empty() {
         return None;
     }
-    let t = tc.parse(ts).filter(|t| (ctx.cws..ctx.we).contains(t))?;
+    let t = unsafe { tc.parse_raw(ts.as_ptr(), ts.len()) }.filter(|t| (ctx.cws..ctx.we).contains(t))?;
     let camp = camp_of.get(unsafe { key::pack16(camp.as_ptr(), camp.len()) })?;
     Some(Ck {
         person: unsafe { key::pack16(user.as_ptr(), user.len()) },

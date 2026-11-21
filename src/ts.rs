@@ -18,13 +18,29 @@ impl Default for TsCache {
 }
 
 impl TsCache {
-    #[inline(always)]
+    /// `parse_raw` on a copy; for callers without a padded buffer (tests).
+    #[cfg(test)]
     pub fn parse(&mut self, b: &[u8]) -> Option<i64> {
-        if b.len() == 20 && b[19] == b'Z' {
+        if b.len() > 32 {
+            return parse::ts(b);
+        }
+        let mut tmp = [0u8; 48];
+        tmp[..b.len()].copy_from_slice(b);
+        unsafe { self.parse_raw(tmp.as_ptr(), b.len()) }
+    }
+
+    /// The timestamp at `p[..len]`, where at least 16 bytes from `p` are readable (the reader pads its buffer).
+    ///
+    /// # Safety
+    /// `p[..max(len, 16)]` must be readable.
+    #[inline(always)]
+    pub unsafe fn parse_raw(&mut self, p: *const u8, len: usize) -> Option<i64> {
+        let b = unsafe { std::slice::from_raw_parts(p, len) };
+        if len == 20 && b[19] == b'Z' {
             return Some(self.date(b)? + time_of_day(&b[11..19])?);
         }
-        if b.len() <= 16 {
-            if let Some(v) = digits(b) {
+        if (1..=16).contains(&len) {
+            if let Some(v) = unsafe { digits16(p, len) } {
                 return Some(v);
             }
         }
@@ -81,20 +97,48 @@ fn time_of_day(t: &[u8]) -> Option<i64> {
     Some(((h * 60 + m) * 60 + s) as i64 * 1000)
 }
 
-/// 1 to 16 ASCII digits as a number, 8 at a time.
-#[inline]
-fn digits(b: &[u8]) -> Option<i64> {
-    if b.is_empty() {
-        return None;
+/// Right-aligns `len` bytes into 16 lanes with `pshufb` and fills the lanes before them with '0'.
+const fn align_tables() -> ([[u8; 16]; 17], [[u8; 16]; 17]) {
+    let (mut shuf, mut fill) = ([[0x80u8; 16]; 17], [[0u8; 16]; 17]);
+    let mut l = 0;
+    while l <= 16 {
+        let mut i = 0;
+        while i < 16 {
+            if i >= 16 - l {
+                shuf[l][i] = (i - (16 - l)) as u8;
+            } else {
+                fill[l][i] = b'0';
+            }
+            i += 1;
+        }
+        l += 1;
     }
-    let mut p = [b'0'; 16];
-    p[16 - b.len()..].copy_from_slice(b);
-    let hi = eight(u64::from_le_bytes(p[..8].try_into().unwrap()))?;
-    let lo = eight(u64::from_le_bytes(p[8..].try_into().unwrap()))?;
-    Some((hi * 100_000_000 + lo) as i64)
+    (shuf, fill)
+}
+static ALIGN: ([[u8; 16]; 17], [[u8; 16]; 17]) = align_tables();
+
+/// 1 to 16 ASCII digits at `p` as a number, 8 at a time, from one 16-byte load (no stack copy: a copy
+/// followed by wider loads stalls on store forwarding).
+#[inline(always)]
+unsafe fn digits16(p: *const u8, len: usize) -> Option<i64> {
+    #[cfg(target_feature = "ssse3")]
+    let (hi, lo) = unsafe {
+        use std::arch::x86_64::*;
+        let v = _mm_loadu_si128(p as *const __m128i);
+        let aligned = _mm_shuffle_epi8(v, _mm_loadu_si128(ALIGN.0[len].as_ptr() as *const __m128i));
+        let d = _mm_or_si128(aligned, _mm_loadu_si128(ALIGN.1[len].as_ptr() as *const __m128i));
+        (_mm_cvtsi128_si64(d) as u64, _mm_extract_epi64::<1>(d) as u64)
+    };
+    #[cfg(not(target_feature = "ssse3"))]
+    let (hi, lo) = {
+        let mut t = [b'0'; 16];
+        t[16 - len..].copy_from_slice(unsafe { std::slice::from_raw_parts(p, len) });
+        (u64::from_le_bytes(t[..8].try_into().unwrap()), u64::from_le_bytes(t[8..].try_into().unwrap()))
+    };
+    Some((eight(hi)? * 100_000_000 + eight(lo)?) as i64)
 }
 
-#[inline]
+#[inline(always)]
 fn eight(w: u64) -> Option<u64> {
     let x = w ^ 0x3030_3030_3030_3030;
     if (x.wrapping_add(0x7676_7676_7676_7676) | x) & 0x8080_8080_8080_8080 != 0 {
