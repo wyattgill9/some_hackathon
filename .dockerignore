@@ -3,3 +3,4 @@ dev/
 out/
 *.md
 .git
+target/

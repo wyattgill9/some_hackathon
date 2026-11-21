@@ -8,9 +8,9 @@ A Databricks Buildathon entry for "Shopping Sessions": clean dirty click-stream 
 
 ## Repo state
 
-The challenge zips are extracted. **No engine has been chosen yet, so there is no root `Dockerfile`.**
+**Engine: one Rust binary** (`Cargo.toml`, `src/main.rs` pipeline, `src/parse.rs` dialect/timestamp parsers with unit tests). The root `Dockerfile` builds it in `rust:1-slim-bookworm` (`target-cpu=x86-64-v3`) and runs it from `debian:bookworm-slim`. It reads `DATA_DIR`/`OUTPUT_DIR`/`NCPU` from the env and logs per-phase timings and the self-check to stderr.
 - `Makefile`, `scripts/`, `fixtures/` (the 36 cases), `.dockerignore`: the shared starter harness. It is identical in all three starters.
-- `starters/{duckdb,polars,pyspark}/`: each starter's engine-specific `Dockerfile`, `run.sh`, `pipeline/`, `requirements.txt` and README. The pyspark `run.sh`/README holds the JVM-in-container workarounds. Copy one to the root, or write your own, once you pick an engine.
+- `starters/{duckdb,polars,pyspark}/`: each starter's engine-specific `Dockerfile`, `run.sh`, `pipeline/`, `requirements.txt` and README. The pyspark `run.sh`/README holds the JVM-in-container workarounds. Reference only; not used.
 - `generator/`: Rust source for `generate` (std only). The flake builds it with plain `rustc` because its `Cargo.lock` is stale.
 - `dev-answer/`: the expected CSVs for the dev set (seed 1, 1M events, 250k clicks).
 
@@ -18,7 +18,7 @@ Submission requirements: a public GitHub repo with a `Dockerfile` **at the repo 
 
 ## Local environment (NixOS)
 
-Use the flake dev shell (`direnv allow`, or `nix develop`). It provides `generate`, `make` and `python3` with polars, which is all the harness needs. Outside it, `python3`, `make` and `docker` are not on PATH. Docker needs a system-level daemon (`virtualisation.docker.enable`), so a flake can't supply it. Add engine dependencies to `flake.nix` once an engine is chosen. Flakes see only git-tracked files, so `git add` new files before `nix develop` can find them.
+Use the flake dev shell (`direnv allow`, or `nix develop`). It provides `generate`, `make` and `python3` with polars, which is all the harness needs. Outside it, `python3`, `make` and `docker` are not on PATH. Docker needs a system-level daemon (`virtualisation.docker.enable`), so a flake can't supply it. The shell also has `cargo`, `rustc` and `clippy`. Flakes see only git-tracked files, so `git add` new files before `nix develop` can find them.
 
 nixpkgs ships polars 1.42. The starters pin `polars==2.1.0` and `duckdb==1.5.6`, so confirm any engine behavior you rely on inside the Docker image.
 
@@ -31,12 +31,19 @@ make dev                       # generate --seed 1 --events 1000000 --clicks 250
 make run-dev                   # timed run on dev/ -> out/   (CPUS=4 MEM=8g to lower limits)
 make check-dev ANSWER=dev-answer   # exact diff of out/ vs unzipped dev-answer
 
+# Native (no Docker): build, unit tests, fixtures, dev diff
+cargo build --release && cargo test --release
+python3 scripts/run_fixtures.py fixtures -- target/release/pipeline
+rm -rf out && DATA_DIR=dev OUTPUT_DIR=out target/release/pipeline && python3 scripts/compare.py out dev-answer
+
 # Without Docker: all fixtures, or one fixture
 python3 scripts/run_fixtures.py fixtures -- <cmd>     # cmd gets DATA_DIR/OUTPUT_DIR as env AND as the last two args
 DATA_DIR=fixtures/E16/input OUTPUT_DIR=out <cmd> && python3 scripts/compare.py out fixtures/E16/expected
 ```
 
-`compare.py` diffs any two folders. Each side can be `<table>.csv` files or `<table>/*.parquet` dirs. Integer columns may be any width, and `day` must be a Parquet `DATE`. `scripts/docker_run.sh DATA OUT` reproduces the scorer's exact `docker run` flags.
+`compare.py` diffs any two folders. Each side can be `<table>.csv` files or `<table>/*.parquet` dirs. Integer columns may be any width, and `day` must be a Parquet `DATE`. `scripts/docker_run.sh DATA OUT` reproduces the scorer's exact `docker run` flags. Without a Docker daemon, rootless podman works: `nix shell nixpkgs#podman`, put a `docker` shim (`exec podman "$@"`) first on PATH, and build with `podman build --signature-policy <file with {"default":[{"type":"insecureAcceptAnything"}]}>` and `CONTAINERS_REGISTRIES_CONF` set to a file with `unqualified-search-registries = ["docker.io"]`.
+
+Larger local sets live outside the repo in `~/data/` (`ss20m` seed 2, `ss60m` seed 3, `ssfeb29` seed 15, whose window holds Feb 29, 2028). They have no answers, so check them with the self-check line and exit 0.
 
 ## Scorer / container constraints
 

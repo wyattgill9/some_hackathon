@@ -14,6 +14,9 @@
       devShells.x86_64-linux.default = pkgs.mkShell {
         packages = [
           generate
+          pkgs.cargo
+          pkgs.rustc
+          pkgs.clippy
           pkgs.gnumake
           (pkgs.python3.withPackages (p: [ p.polars ]))  # scripts/run_fixtures.py and compare.py
         ];
