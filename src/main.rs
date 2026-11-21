@@ -295,6 +295,7 @@ fn main() {
         evs[t].release();
         cks[t].release();
         ev2[t].release();
+        reader::release_maps(t, threads);
         if t == 0 {
             links.release();
         }
