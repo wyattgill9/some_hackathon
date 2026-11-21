@@ -6,17 +6,26 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 
 use crate::key::{self, Key, mix};
+use crate::mem::{self, map_huge};
 use crate::parallel;
-use crate::pool::map_huge;
 
 pub struct Links {
     table: &'static [[Key; 2]], // (id, name); id 0 = empty. Huge pages: lookups are random and prefetched.
     mask: usize,
 }
 
-/// A zeroed, huge-page-backed slice that lives until exit.
+/// A zeroed, huge-page-backed slice that lives until released.
 fn huge_slice<T>(n: usize) -> &'static mut [T] {
     unsafe { std::slice::from_raw_parts_mut(map_huge(n * std::mem::size_of::<T>()) as *mut T, n) }
+}
+
+/// Faults a slice's pages in (written, in bulk) where huge pages would not; see `mem::populate`.
+fn populate<T>(s: &[T]) {
+    mem::populate(s.as_ptr() as *mut u8, std::mem::size_of_val(s));
+}
+
+fn release<T>(s: &[T]) {
+    mem::release(s.as_ptr() as *mut u8, std::mem::size_of_val(s));
 }
 
 impl Links {
@@ -27,8 +36,11 @@ impl Links {
         let keys: &[AtomicU64] = huge_slice(cap); // zero = empty
         let parent: &[AtomicU32] = huge_slice(cap);
         let chunk = cap.div_ceil(threads).max(1);
+        let span = |t: usize| (t * chunk).min(cap)..((t + 1) * chunk).min(cap); // empty for spare threads
         parallel(threads, |t| {
-            for i in t * chunk..((t + 1) * chunk).min(cap) {
+            populate(&keys[span(t)]);
+            populate(&parent[span(t)]);
+            for i in span(t) {
                 parent[i].store(i as u32, Relaxed);
             }
         });
@@ -99,6 +111,7 @@ impl Links {
             for (c, out) in table.chunks_mut(chunk).enumerate() {
                 let (keys, find) = (&keys, &find);
                 s.spawn(move || {
+                    populate(out);
                     for (i, o) in out.iter_mut().enumerate() {
                         let k = keys[c * chunk + i].load(Relaxed);
                         if k != 0 {
@@ -108,7 +121,17 @@ impl Links {
                 });
             }
         });
+        // The union-find is dead now: its pages go back on all threads rather than at exit on one.
+        parallel(threads, |t| {
+            release(&keys[span(t)]);
+            release(&parent[span(t)]);
+        });
         Links { table, mask }
+    }
+
+    /// Gives the table's pages back; the table must not be used afterwards.
+    pub fn release(&self) {
+        release(self.table);
     }
 
     #[inline]

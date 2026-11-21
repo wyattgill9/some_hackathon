@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use crate::key::{self, Key, mix};
+use crate::mem;
 use crate::parquet::{self, Column, Kind};
 use crate::{Ck, Ctx, DAY, Ev2, GAP, WEEK};
 
@@ -118,12 +119,14 @@ impl<'a> Worker<'a> {
             out: Out {
                 sessions: Vec::new(),
                 purchases: Vec::new(),
-                cat_rev: vec![0; ctx.cats.len()],
+                cat_rev: mem::zeroed(ctx.cats.len()),
                 touched: Vec::new(),
-                win: Window { count: vec![0; ctx.ncamp], pos: vec![0; ctx.ncamp], active: Vec::new() },
+                win: Window { count: mem::zeroed(ctx.ncamp), pos: mem::zeroed(ctx.ncamp), active: Vec::new() },
                 buf: Vec::new(),
                 rows: Rows::default(),
-                cells: vec![Cell::default(); (ctx.ncamp + 1) * ctx.ndays],
+                // Written pages, not calloc: these are read-modify-written, and a calloc page read first
+                // maps the zero page, whose copy-on-write flushes every thread's TLB.
+                cells: mem::zeroed((ctx.ncamp + 1) * ctx.ndays),
             },
         }
     }
