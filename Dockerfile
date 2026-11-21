@@ -8,7 +8,7 @@ COPY generator ./generator
 # Scorers are Intel Xeon Cascade Lake: tune for it, keep jumps off 32-byte boundaries (the JCC erratum
 # mitigation empties the uop cache otherwise), and link statically so nothing is loaded at run time.
 # No AVX-512: a single 512-bit instruction drops the core's clock for a while, and the hot loops are AVX2.
-ENV BASE="-C target-cpu=cascadelake -C target-feature=+crt-static,-avx512f -C llvm-args=-x86-branches-within-32B-boundaries"
+ENV BASE="-C target-cpu=cascadelake -C target-feature=+crt-static,-avx512f -C no-vectorize-slp -C llvm-args=-x86-branches-within-32B-boundaries"
 ENV TARGET="x86_64-unknown-linux-gnu"
 # Profile-guided build: an instrumented binary runs on a 2M-event set from the track's own generator, and
 # the final binary is compiled with that profile. Any failure along the way falls back to a plain build.
