@@ -55,18 +55,41 @@ impl Links {
                 x = gp;
             }
         };
+        // Edges go through in batches of 16: the key lines of the next batch and the parent lines of this
+        // one are prefetched, so the table's cache misses overlap instead of stalling one by one.
+        let prefetch = |p: *const u8| {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(p as *const i8)
+            };
+        };
         parallel(threads.min(edges.len().max(1)), |t| {
-            for &(a, b) in &edges[t] {
-                let (sa, sb) = (slot(a) as u32, slot(b) as u32);
-                loop {
-                    let (ra, rb) = (find(sa), find(sb));
-                    if ra == rb {
-                        break;
+            let batches: Vec<&[(Key, Key)]> = edges[t].chunks(16).collect();
+            let mut slots = [(0u32, 0u32); 16];
+            for (i, batch) in batches.iter().enumerate() {
+                if let Some(next) = batches.get(i + 1) {
+                    for &(a, b) in *next {
+                        prefetch(keys[(mix(a) >> 32) as usize & mask].as_ptr() as *const u8);
+                        prefetch(keys[(mix(b) >> 32) as usize & mask].as_ptr() as *const u8);
                     }
-                    let (ka, kb) = (keys[ra as usize].load(Relaxed), keys[rb as usize].load(Relaxed));
-                    let (lo, hi) = if key::cmp(ka, kb).is_lt() { (ra, rb) } else { (rb, ra) };
-                    if parent[hi as usize].compare_exchange(hi, lo, Relaxed, Relaxed).is_ok() {
-                        break;
+                }
+                for (j, &(a, b)) in batch.iter().enumerate() {
+                    let (sa, sb) = (slot(a) as u32, slot(b) as u32);
+                    prefetch(parent[sa as usize].as_ptr() as *const u8);
+                    prefetch(parent[sb as usize].as_ptr() as *const u8);
+                    slots[j] = (sa, sb);
+                }
+                for &(sa, sb) in &slots[..batch.len()] {
+                    loop {
+                        let (ra, rb) = (find(sa), find(sb));
+                        if ra == rb {
+                            break;
+                        }
+                        let (ka, kb) = (keys[ra as usize].load(Relaxed), keys[rb as usize].load(Relaxed));
+                        let (lo, hi) = if key::cmp(ka, kb).is_lt() { (ra, rb) } else { (rb, ra) };
+                        if parent[hi as usize].compare_exchange(hi, lo, Relaxed, Relaxed).is_ok() {
+                            break;
+                        }
                     }
                 }
             }

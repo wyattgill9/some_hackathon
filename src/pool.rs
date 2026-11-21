@@ -55,7 +55,7 @@ impl<T: Copy> Pool<T> {
         }
     }
 
-    #[inline(always)]
+    #[inline(never)]
     fn flush(&mut self, p: usize) {
         if self.cur[p].is_null() || self.used[p] as usize + STAGE > self.cap {
             self.new_block(p);
