@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use crate::key::{self, Key};
-use crate::parquet::{self, Column, Kind};
+use crate::parquet::{self, Column, Enc, Kind};
 use crate::{Ck, Ctx, DAY, Ev2, GAP, WEEK};
 
 const NONE: u32 = u32::MAX;
@@ -25,17 +25,19 @@ pub struct Cell {
     pub revenue: i64,
 }
 
-/// user_daily rows as PLAIN column bodies, ready for the writer.
+/// user_daily rows as columns: strings as lengths and bytes, `present` as packed bits.
 #[derive(Default)]
 pub struct Rows {
     pub n: usize,
-    ids: Vec<u8>,
+    idlen: Vec<i32>,
+    idbytes: Vec<u8>,
     day: Vec<i32>,
     sessions: Vec<i32>,
     events: Vec<i32>,
     revenue: Vec<i64>,
-    present: Vec<bool>,
-    tops: Vec<u8>,
+    present: Vec<u8>,
+    toplen: Vec<i32>,
+    topbytes: Vec<u8>,
 }
 
 /// A session: start in ms from `cws`, day index, purchase revenue.
@@ -345,23 +347,36 @@ impl<'a> Worker<'a> {
         Some(np)
     }
 
-    pub fn finish(mut self, user_file: &Path) -> (Vec<Cell>, usize) {
+    /// The campaign cells, the user_daily row count and the encoded user_daily file.
+    pub fn finish(mut self) -> (Vec<Cell>, usize, UserFile) {
         for (c, &a) in self.out.cells.iter_mut().zip(&self.out.assisted) {
             c.assisted = a;
         }
-        let r = &self.out.rows;
-        let mut top = parquet::def_levels(&r.present);
-        top.extend_from_slice(&r.tops);
+        let r = self.out.rows;
+        let d = parquet::delta::<i32>;
+        let enc = [d(&r.idlen), d(&r.day), d(&r.sessions), d(&r.events), parquet::delta(&r.revenue), parquet::def_levels(&r.present, r.n), d(&r.toplen)];
+        (self.out.cells, r.n, UserFile { rows: r, enc })
+    }
+}
+
+/// A worker's user_daily table, encoded: the delta bodies of the integer and length columns, the string bytes.
+pub struct UserFile {
+    rows: Rows,
+    enc: [Vec<u8>; 7],
+}
+
+impl UserFile {
+    pub fn write(&self, path: &Path) {
+        let (r, [idl, day, sess, ev, rev, def, topl]) = (&self.rows, &self.enc);
         let cols = [
-            Column { name: "user_id", kind: Kind::Str, optional: false, body: &r.ids },
-            Column { name: "day", kind: Kind::Date, optional: false, body: parquet::plain(&r.day) },
-            Column { name: "sessions", kind: Kind::Int32, optional: false, body: parquet::plain(&r.sessions) },
-            Column { name: "events", kind: Kind::Int32, optional: false, body: parquet::plain(&r.events) },
-            Column { name: "revenue_cents", kind: Kind::Int64, optional: false, body: parquet::plain(&r.revenue) },
-            Column { name: "top_category", kind: Kind::Str, optional: true, body: &top },
+            Column { name: "user_id", kind: Kind::Str, enc: Enc::Delta, optional: false, parts: &[idl, &r.idbytes] },
+            Column { name: "day", kind: Kind::Date, enc: Enc::Delta, optional: false, parts: &[day] },
+            Column { name: "sessions", kind: Kind::Int32, enc: Enc::Delta, optional: false, parts: &[sess] },
+            Column { name: "events", kind: Kind::Int32, enc: Enc::Delta, optional: false, parts: &[ev] },
+            Column { name: "revenue_cents", kind: Kind::Int64, enc: Enc::Delta, optional: false, parts: &[rev] },
+            Column { name: "top_category", kind: Kind::Str, enc: Enc::Delta, optional: true, parts: &[def, topl, &r.topbytes] },
         ];
-        parquet::write(user_file, r.n, &cols).unwrap();
-        (self.out.cells, r.n)
+        parquet::write(path, r.n, &cols).unwrap();
     }
 }
 
@@ -468,36 +483,39 @@ fn flush(ctx: &Ctx, o: &mut Out, day: i32, sessions: u32, events: u32, rev: i64)
     }
     o.touched.clear();
     let r = &mut o.rows;
+    r.idlen.push(o.buf.len() as i32);
     if o.buf.len() <= 16 {
-        put16(&mut r.ids, o.id, o.buf.len());
+        put16(&mut r.idbytes, o.id, o.buf.len());
     } else {
-        parquet::put_str(&mut r.ids, &o.buf);
+        r.idbytes.extend_from_slice(&o.buf);
     }
     r.day.push(day);
     r.sessions.push(sessions as i32);
     r.events.push(events as i32);
     r.revenue.push(rev);
-    r.present.push(top != NONE);
+    if r.n % 8 == 0 {
+        r.present.push(0);
+    }
+    *r.present.last_mut().unwrap() |= ((top != NONE) as u8) << (r.n % 8);
     if top != NONE {
         let c = &ctx.cats[top as usize];
+        r.toplen.push(c.len() as i32);
         if c.len() <= 16 {
-            put16(&mut r.tops, o.cat16[top as usize], c.len());
+            put16(&mut r.topbytes, o.cat16[top as usize], c.len());
         } else {
-            parquet::put_str(&mut r.tops, c);
+            r.topbytes.extend_from_slice(c);
         }
     }
     r.n += 1;
 }
 
-/// A PLAIN BYTE_ARRAY value of `len <= 16` bytes from a padded copy: one store each for the length and the bytes.
+/// Appends `len <= 16` bytes from a padded copy with one store.
 #[inline(always)]
 fn put16(out: &mut Vec<u8>, v: [u8; 16], len: usize) {
-    out.reserve(20);
+    out.reserve(16);
     unsafe {
-        let p = out.as_mut_ptr().add(out.len());
-        p.cast::<u32>().write_unaligned(len as u32);
-        p.add(4).cast::<[u8; 16]>().write_unaligned(v);
-        out.set_len(out.len() + 4 + len);
+        out.as_mut_ptr().add(out.len()).cast::<[u8; 16]>().write_unaligned(v);
+        out.set_len(out.len() + len);
     }
 }
 

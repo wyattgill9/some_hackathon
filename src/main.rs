@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use key::{Key, mix};
-use parquet::{Column, Kind};
+use parquet::{Column, Enc, Kind};
 use person::Cell;
 use pool::Pool;
 use reader::{Line, Range, Reader};
@@ -241,64 +241,74 @@ fn main() {
     });
     lap("dedup");
 
-    // People per person partition, largest first; each worker writes its own user_daily file.
+    // People per person partition, largest first; each worker writes its own user_daily file. Its cells and
+    // row count go to the main thread first, which writes campaign_daily while the user files are written.
     let mut order: Vec<usize> = (0..parts).collect();
     order.sort_by_key(|&q| std::cmp::Reverse(ev2.iter().map(|t| t.len(q)).sum::<usize>()));
     let next = AtomicUsize::new(0);
-    let results: Vec<(Vec<Cell>, usize)> = parallel(threads, |t| {
-        let mut w = person::Worker::new(&ctx);
-        loop {
-            let i = next.fetch_add(1, Ordering::Relaxed);
-            let Some(&q) = order.get(i) else { break };
-            w.run(ev2.iter().flat_map(|t| t.blocks(q)), cks.iter().flat_map(|t| t.blocks(q)));
+    let (tx, rx) = std::sync::mpsc::channel::<(Vec<Cell>, usize)>();
+    let (rows, cs, cr, nrows) = std::thread::scope(|s| {
+        for t in 0..threads {
+            let (tx, ctx, out, ev2, cks, order, next) = (tx.clone(), &ctx, &out, &ev2, &cks, &order, &next);
+            s.spawn(move || {
+                let mut w = person::Worker::new(ctx);
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(&q) = order.get(i) else { break };
+                    w.run(ev2.iter().flat_map(|t| t.blocks(q)), cks.iter().flat_map(|t| t.blocks(q)));
+                }
+                let (cells, n, cols) = w.finish();
+                tx.send((cells, n)).unwrap();
+                cols.write(&out.join("user_daily").join(format!("part-{t}.parquet")));
+            });
         }
-        w.finish(&out.join("user_daily").join(format!("part-{t}.parquet")))
+        drop(tx);
+        // campaign_daily: the threads' cells summed; a row wherever a campaign credited or assisted a session.
+        let (mut cells, mut rows) = (vec![Cell::default(); (ncamp + 1) * ndays], 0);
+        for (c, n) in rx {
+            rows += n;
+            for (a, b) in cells.iter_mut().zip(&c) {
+                a.sessions += b.sessions;
+                a.purchasing += b.purchasing;
+                a.assisted += b.assisted;
+                a.revenue += b.revenue;
+            }
+        }
+        let (mut cid, mut chan, mut days) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut c0, mut c1, mut c2, mut c3) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for (i, cell) in cells.iter().enumerate() {
+            if cell.sessions == 0 && cell.assisted == 0 {
+                continue;
+            }
+            let (c, d) = (i / ndays, i % ndays);
+            let [id, ch] = if c == ncamp { [&b"organic"[..]; 2] } else { campaigns[c] };
+            parquet::put_str(&mut cid, id);
+            parquet::put_str(&mut chan, ch);
+            days.push((day0 + d as i64) as i32);
+            c0.push(cell.sessions as i64);
+            c1.push(cell.purchasing as i64);
+            c2.push(cell.revenue);
+            c3.push(cell.assisted as i64);
+        }
+        let plain = |kind, name, body| Column { name, kind, enc: Enc::Plain, optional: false, parts: body };
+        parquet::write(
+            &out.join("campaign_daily").join("part-0.parquet"),
+            days.len(),
+            &[
+                plain(Kind::Str, "campaign_id", &[&cid]),
+                plain(Kind::Str, "channel", &[&chan]),
+                plain(Kind::Date, "day", &[parquet::plain(&days)]),
+                plain(Kind::Int64, "sessions", &[parquet::plain(&c0)]),
+                plain(Kind::Int64, "purchasing_sessions", &[parquet::plain(&c1)]),
+                plain(Kind::Int64, "revenue_cents", &[parquet::plain(&c2)]),
+                plain(Kind::Int64, "assisted_sessions", &[parquet::plain(&c3)]),
+            ],
+        )
+        .unwrap();
+        (rows, c0.iter().sum::<i64>(), c2.iter().sum::<i64>(), days.len())
     });
     lap("people");
-
-    // campaign_daily: the threads' cells summed; a row wherever a campaign credited or assisted a session.
-    let mut cells = vec![Cell::default(); (ncamp + 1) * ndays];
-    for (c, _) in &results {
-        for (a, b) in cells.iter_mut().zip(c) {
-            a.sessions += b.sessions;
-            a.purchasing += b.purchasing;
-            a.assisted += b.assisted;
-            a.revenue += b.revenue;
-        }
-    }
-    let (mut cid, mut chan, mut days) = (Vec::new(), Vec::new(), Vec::new());
-    let (mut c0, mut c1, mut c2, mut c3) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    for (i, cell) in cells.iter().enumerate() {
-        if cell.sessions == 0 && cell.assisted == 0 {
-            continue;
-        }
-        let (c, d) = (i / ndays, i % ndays);
-        let [id, ch] = if c == ncamp { [&b"organic"[..]; 2] } else { campaigns[c] };
-        parquet::put_str(&mut cid, id);
-        parquet::put_str(&mut chan, ch);
-        days.push((day0 + d as i64) as i32);
-        c0.push(cell.sessions as i64);
-        c1.push(cell.purchasing as i64);
-        c2.push(cell.revenue);
-        c3.push(cell.assisted as i64);
-    }
-    parquet::write(
-        &out.join("campaign_daily").join("part-0.parquet"),
-        days.len(),
-        &[
-            Column { name: "campaign_id", kind: Kind::Str, optional: false, body: &cid },
-            Column { name: "channel", kind: Kind::Str, optional: false, body: &chan },
-            Column { name: "day", kind: Kind::Date, optional: false, body: parquet::plain(&days) },
-            Column { name: "sessions", kind: Kind::Int64, optional: false, body: parquet::plain(&c0) },
-            Column { name: "purchasing_sessions", kind: Kind::Int64, optional: false, body: parquet::plain(&c1) },
-            Column { name: "revenue_cents", kind: Kind::Int64, optional: false, body: parquet::plain(&c2) },
-            Column { name: "assisted_sessions", kind: Kind::Int64, optional: false, body: parquet::plain(&c3) },
-        ],
-    )
-    .unwrap();
-    let rows: usize = results.iter().map(|r| r.1).sum();
-    let (cs, cr) = (c0.iter().sum::<i64>(), c2.iter().sum::<i64>());
-    lap(&format!("write: {rows} user rows, {} campaign rows; sessions {cs}, revenue {cr}", days.len()));
+    lap(&format!("write: {rows} user rows, {nrows} campaign rows; sessions {cs}, revenue {cr}"));
     // Nothing is dropped; the big mappings are released on all threads so exit does not tear them down on one.
     parallel(threads, |t| {
         evs[t].release();
