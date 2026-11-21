@@ -49,20 +49,6 @@ impl U64Map {
         self.vals[i] = v;
     }
 
-    pub fn get_or_insert_with(&mut self, k: u64, f: impl FnOnce() -> u32) -> u32 {
-        assert!(k != 0);
-        if self.len * 2 >= self.keys.len() {
-            self.grow();
-        }
-        let i = self.slot(k);
-        if self.keys[i] == 0 {
-            self.keys[i] = k;
-            self.vals[i] = f();
-            self.len += 1;
-        }
-        self.vals[i]
-    }
-
     fn grow(&mut self) {
         let cap = self.keys.len() * 2;
         let old_keys = std::mem::replace(&mut self.keys, vec![0; cap]);
@@ -93,7 +79,5 @@ mod tests {
         }
         assert_eq!(m.get(7), None);
         assert_eq!(m.get(0), None);
-        assert_eq!(m.get_or_insert_with(7, || 1), 1);
-        assert_eq!(m.get_or_insert_with(7, || 2), 1);
     }
 }

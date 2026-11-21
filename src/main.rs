@@ -149,7 +149,7 @@ fn main() {
             });
         }
     });
-    let links = links::Links::build(&edges);
+    let links = links::Links::build(&edges, threads);
     drop(edges);
     lap("links");
 
@@ -292,7 +292,7 @@ fn main() {
 }
 
 /// `n` threads running `f(thread index)`; their results in order.
-fn parallel<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+pub fn parallel<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
     std::thread::scope(|s| {
         let f = &f;
         let handles: Vec<_> = (0..n).map(|t| s.spawn(move || f(t))).collect();
@@ -343,13 +343,14 @@ fn parse_event([id, user, ts, ingest, kind, product, price]: [&[u8]; 7], ctx: &C
     let mut pay = 0;
     if valid && kind == b"purchase" {
         match parse::price(price) {
-            Some(v) => pay = v | cat_of.get(key::pack(product)).unwrap_or(ctx.unknown) << 24,
+            Some(v) => pay = v | cat_of.get(unsafe { key::pack16(product.as_ptr(), product.len()) }).unwrap_or(ctx.unknown) << 24,
             None => valid = false,
         }
     }
+    // Fields point into the reader's buffer, which keeps 64 readable bytes past the data.
     Some(Ev {
-        eid: key::pack(id),
-        person: if valid { key::pack(user) } else { 0 },
+        eid: unsafe { key::pack16(id.as_ptr(), id.len()) },
+        person: if valid { unsafe { key::pack16(user.as_ptr(), user.len()) } } else { 0 },
         ingest: (ing.div_euclid(1000) - ctx.cws.div_euclid(1000) + (1 << 31)).clamp(0, u32::MAX as i64) as u32,
         ts: t.map_or(0, |t| (t - ctx.cws) as u32),
         pay,
@@ -364,8 +365,13 @@ fn parse_click([id, user, camp, ts]: [&[u8]; 4], ctx: &Ctx, camp_of: &U64Map, tc
         return None;
     }
     let t = tc.parse(ts).filter(|t| (ctx.cws..ctx.we).contains(t))?;
-    let camp = camp_of.get(key::pack(camp))?;
-    Some(Ck { person: key::pack(user), cid: key::pack(id), ts: (t - ctx.cws) as u32, camp })
+    let camp = camp_of.get(unsafe { key::pack16(camp.as_ptr(), camp.len()) })?;
+    Some(Ck {
+        person: unsafe { key::pack16(user.as_ptr(), user.len()) },
+        cid: unsafe { key::pack16(id.as_ptr(), id.len()) },
+        ts: (t - ctx.cws) as u32,
+        camp,
+    })
 }
 
 /// One event partition: an open-addressing table on the bits below the partition bits keeps, per event_id,

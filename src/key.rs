@@ -45,6 +45,51 @@ pub fn pack(id: &[u8]) -> Key {
     intern(id)
 }
 
+/// `pack` for a field inside a buffer with at least 16 readable bytes from `p`: one 16-byte load classifies
+/// every byte at once; anything irregular takes the scalar path.
+///
+/// # Safety
+/// `p[..16]` must be readable.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1", target_feature = "bmi2"))]
+#[inline]
+pub unsafe fn pack16(p: *const u8, len: usize) -> Key {
+    use std::arch::x86_64::*;
+    unsafe {
+        if len == 0 || len > 10 {
+            return pack(std::slice::from_raw_parts(p, len));
+        }
+        let v = _mm_loadu_si128(p as *const __m128i);
+        let ge = |lo: u8| _mm_cmpgt_epi8(v, _mm_set1_epi8(lo as i8 - 1));
+        let le = |hi: u8| _mm_cmpgt_epi8(_mm_set1_epi8(hi as i8 + 1), v);
+        let digit = _mm_and_si128(ge(b'0'), le(b'9'));
+        let upper = _mm_and_si128(ge(b'A'), le(b'Z'));
+        let under = _mm_cmpeq_epi8(v, _mm_set1_epi8(b'_' as i8));
+        let lower = _mm_and_si128(ge(b'a'), le(b'z'));
+        let any = _mm_or_si128(_mm_or_si128(digit, upper), _mm_or_si128(under, lower));
+        let lanes = (1u32 << len) - 1;
+        if _mm_movemask_epi8(any) as u32 & lanes != lanes {
+            return pack(std::slice::from_raw_parts(p, len));
+        }
+        let code = |m: __m128i, off: u8| _mm_and_si128(m, _mm_sub_epi8(v, _mm_set1_epi8(off as i8)));
+        let codes = _mm_or_si128(
+            _mm_or_si128(code(digit, b'0' - 1), code(upper, b'A' - 11)),
+            _mm_or_si128(_mm_and_si128(under, _mm_set1_epi8(37)), code(lower, b'a' - 38)),
+        );
+        // Lanes past the ID must be zero: pack from a copy with the tail cleared.
+        let mut bytes = [0u8; 16];
+        _mm_storeu_si128(bytes.as_mut_ptr() as *mut __m128i, codes);
+        bytes[len..].fill(0);
+        let head = _pext_u64(u64::from_be_bytes(bytes[..8].try_into().unwrap()), 0x3f3f_3f3f_3f3f_3f3f);
+        head << 16 | (bytes[8] as u64) << 10 | (bytes[9] as u64) << 4
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1", target_feature = "bmi2")))]
+#[inline]
+pub unsafe fn pack16(p: *const u8, len: usize) -> Key {
+    pack(unsafe { std::slice::from_raw_parts(p, len) })
+}
+
 #[inline]
 pub fn is_packed(k: Key) -> bool {
     k & 1 == 0
@@ -139,6 +184,27 @@ mod tests {
         }
         assert_eq!(pack(b""), 0);
         assert_ne!(pack(b"u1"), pack(b"U1"));
+    }
+
+    #[test]
+    fn simd_matches_scalar() {
+        let mut rng = 0x1357_9bdf_2468_ace0u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut buf = vec![b'z'; 64];
+        for _ in 0..20000 {
+            let n = (next() % 13) as usize;
+            for b in &mut buf[..n] {
+                *b = if next() % 4 == 0 { (next() % 256) as u8 } else { DECODE[1 + (next() % 63) as usize] };
+            }
+            buf[n] = b','; // what follows a field in a line
+            let id = &buf[..n];
+            assert_eq!(unsafe { pack16(buf.as_ptr(), n) }, pack(id), "{:?}", String::from_utf8_lossy(id));
+        }
     }
 
     #[test]
