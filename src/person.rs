@@ -61,7 +61,6 @@ struct Out {
     sessions: Vec<Sess>,
     /// `day_first[d]` = index of the person's first session on day `d` or later; `ndays + 1` entries.
     day_first: Vec<u32>,
-    purchases: Vec<u32>,
     cat_rev: Vec<u64>,
     touched: Vec<u32>,
     /// Per campaign, `person << 32 | sessions already counted as assisted` (stale when the person differs).
@@ -98,10 +97,15 @@ pub struct Worker<'a> {
     boffs: Vec<u32>,
     cursor: Vec<u32>,
     lis: Vec<u32>,
+    /// Events by bin as `ts << 32 | local id`, then by person as `ts`; purchases apart as (local id, ts, pay),
+    /// then by person as (ts, pay).
     tmp: Vec<u64>,
-    tmp_li: Vec<u32>,
     offs: Vec<u32>,
-    sorted: Vec<u64>,
+    sorted: Vec<u32>,
+    purch: Vec<[u32; 3]>,
+    pcounts: Vec<u32>,
+    poffs: Vec<u32>,
+    psorted: Vec<[u32; 2]>,
     ccounts: Vec<u32>,
     coffs: Vec<u32>,
     ctmp: Vec<[u64; 2]>,
@@ -124,9 +128,12 @@ impl<'a> Worker<'a> {
             cursor: Vec::new(),
             lis: Vec::new(),
             tmp: Vec::new(),
-            tmp_li: Vec::new(),
             offs: Vec::new(),
             sorted: Vec::new(),
+            purch: Vec::new(),
+            pcounts: Vec::new(),
+            poffs: Vec::new(),
+            psorted: Vec::new(),
             ccounts: Vec::new(),
             coffs: Vec::new(),
             ctmp: Vec::new(),
@@ -135,7 +142,6 @@ impl<'a> Worker<'a> {
             out: Out {
                 sessions: Vec::new(),
                 day_first: Vec::new(),
-                purchases: Vec::new(),
                 cat_rev: mem::zeroed(ctx.cats.len()),
                 touched: Vec::new(),
                 covered: mem::zeroed(ctx.ncamp),
@@ -199,12 +205,28 @@ impl<'a> Worker<'a> {
         self.sorted.reserve(n);
         unsafe {
             let (srt, cur) = (self.sorted.as_mut_ptr(), self.cursor.as_mut_ptr());
-            for (&rec, &li) in self.tmp.iter().zip(&self.tmp_li) {
-                let c = cur.add(li as usize);
-                *srt.add(*c as usize) = rec;
+            for &rec in &self.tmp {
+                let c = cur.add(rec as u32 as usize);
+                *srt.add(*c as usize) = (rec >> 32) as u32;
                 *c += 1;
             }
             self.sorted.set_len(n);
+        }
+        // Purchases by person, each person's in ts order.
+        self.pcounts.clear();
+        self.pcounts.resize(np, 0);
+        for p in &self.purch {
+            self.pcounts[p[0] as usize] += 1;
+        }
+        prefix(&self.pcounts, &mut self.poffs);
+        self.cursor.clear();
+        self.cursor.extend_from_slice(&self.poffs[..np]);
+        self.psorted.clear();
+        self.psorted.resize(self.purch.len(), [0; 2]);
+        for p in &self.purch {
+            let c = &mut self.cursor[p[0] as usize];
+            self.psorted[*c as usize] = [p[1], p[2]];
+            *c += 1;
         }
         // Clicks of people with no events are dropped: they can credit nothing. The rest are counting-sorted
         // by bin then person like the events; ties within a bin are ordered per person.
@@ -278,16 +300,20 @@ impl<'a> Worker<'a> {
         }
         for li in 0..np {
             let evs = &self.sorted[self.offs[li] as usize..self.offs[li + 1] as usize];
+            let purch = &mut self.psorted[self.poffs[li] as usize..self.poffs[li + 1] as usize];
+            if purch.len() > 1 {
+                purch.sort_unstable_by_key(|p| p[0]);
+            }
             let cks = &mut self.csorted[self.coffs[li] as usize..self.coffs[li + 1] as usize];
             order_bins(cks);
-            person(self.ctx, &mut self.out, self.table[self.persons[li] as usize].key, evs, cks);
+            person(self.ctx, &mut self.out, self.table[self.persons[li] as usize].key, evs, purch, cks);
         }
         for &s in &self.persons {
             self.table[s as usize] = Slot::default();
         }
     }
 
-    /// Scatters the events by bin into `tmp` (`ts << 32 | pay`) and `tmp_li` (local id), building the index:
+    /// Scatters the events by bin into `tmp` (`ts << 32 | local id`), the purchases also into `purch`, building the index:
     /// the number of persons, or None (and a cleared table) when the table got half full.
     fn index(&mut self, eblocks: &[&[Ev2]], n: usize) -> Option<usize> {
         let cap = self.table.len();
@@ -298,13 +324,14 @@ impl<'a> Worker<'a> {
         self.cursor.extend_from_slice(&self.boffs[..self.nbins]);
         self.tmp.clear();
         self.tmp.reserve(n);
-        self.tmp_li.clear();
-        self.tmp_li.reserve(n);
+        self.purch.clear();
+        self.purch.reserve(n);
         let mut np = 0usize;
         // Every event writes one of the n reserved slots (bins from the window, counted above), every new
         // person (at most cap / 2) one `persons` slot; probes wrap within the table.
         let full = unsafe {
-            let (t, tmp, tli, cur, ps) = (self.table.as_mut_ptr(), self.tmp.as_mut_ptr(), self.tmp_li.as_mut_ptr(), self.cursor.as_mut_ptr(), self.persons.as_mut_ptr());
+            let (t, tmp, cur, ps, pu) = (self.table.as_mut_ptr(), self.tmp.as_mut_ptr(), self.cursor.as_mut_ptr(), self.persons.as_mut_ptr(), self.purch.as_mut_ptr());
+            let mut npu = 0;
             let mut full = false;
             'all: for e in eblocks.iter().flat_map(|b| b.iter()) {
                 let mut i = (e.person.wrapping_mul(HASH) >> shift) as usize;
@@ -329,14 +356,17 @@ impl<'a> Worker<'a> {
                 let c = cur.add((e.ts >> BIN) as usize);
                 let p = *c as usize;
                 *c += 1;
-                *tmp.add(p) = (e.ts as u64) << 32 | e.pay as u64;
-                *tli.add(p) = li;
+                *tmp.add(p) = (e.ts as u64) << 32 | li as u64;
+                if e.pay != 0 {
+                    *pu.add(npu) = [li, e.ts, e.pay];
+                    npu += 1;
+                }
             }
             if !full {
                 self.tmp.set_len(n);
-                self.tmp_li.set_len(n);
             }
             self.persons.set_len(np);
+            self.purch.set_len(npu);
             full
         };
         if full {
@@ -408,11 +438,11 @@ fn order_bins(cks: &mut [[u64; 2]]) {
     }
 }
 
-/// One person: events `ts << 32 | pay` grouped by bin in bin order (unordered within a bin), and clicks
+/// One person: event timestamps grouped by bin in bin order (unordered within a bin), purchases `(ts, pay)` in ts order, and clicks
 /// `[ts << 32 | campaign, click_id]` sorted as above. Events in one bin are under 30 minutes apart, so they
 /// share a session; a session boundary falls between two consecutive non-empty bins iff the gap from the
 /// earlier bin's last event to the later bin's first is over 30 minutes.
-fn person(ctx: &Ctx, o: &mut Out, pk: Key, evs: &[u64], cks: &[[u64; 2]]) {
+fn person(ctx: &Ctx, o: &mut Out, pk: Key, evs: &[u32], purch: &[[u32; 2]], cks: &[[u64; 2]]) {
     o.sessions.clear();
     o.person += 1;
     o.buf.clear();
@@ -424,21 +454,22 @@ fn person(ctx: &Ctx, o: &mut Out, pk: Key, evs: &[u64], cks: &[[u64; 2]]) {
     let (mut day, mut sessions, mut events, mut rev) = (i32::MIN, 0u32, 0u32, 0i64);
     let mut prev_hi = 0u32;
 
-    let mut i = 0;
+    let (mut i, mut pi) = (0, 0);
     while i < evs.len() {
-        let bin = (evs[i] >> (32 + BIN)) as u32;
+        let bin = evs[i] >> BIN;
         let (mut lo, mut hi, mut count, mut brev) = (u32::MAX, 0u32, 0u32, 0i64);
-        o.purchases.clear();
-        while i < evs.len() && (evs[i] >> (32 + BIN)) as u32 == bin {
-            let (t, pay) = ((evs[i] >> 32) as u32, evs[i] as u32);
+        while i < evs.len() && evs[i] >> BIN == bin {
+            let t = evs[i];
             lo = lo.min(t);
             hi = hi.max(t);
             count += 1;
-            if pay != 0 {
-                brev += (pay & 0xff_ffff) as i64;
-                o.purchases.push(pay); // applied once the session, so the day, is known
-            }
             i += 1;
+        }
+        // The bin's purchases, applied once the session, so the day, is known.
+        let p0 = pi;
+        while pi < purch.len() && purch[pi][0] >> BIN == bin {
+            brev += (purch[pi][1] & 0xff_ffff) as i64;
+            pi += 1;
         }
         if o.sessions.is_empty() || lo - prev_hi > GAP as u32 {
             let d = (ctx.cws + lo as i64).div_euclid(DAY) as i32;
@@ -453,7 +484,7 @@ fn person(ctx: &Ctx, o: &mut Out, pk: Key, evs: &[u64], cks: &[[u64; 2]]) {
         events += count;
         rev += brev;
         o.sessions.last_mut().unwrap().rev += brev as u64;
-        for &pay in &o.purchases {
+        for &[_, pay] in &purch[p0..pi] {
             let (price, cat) = ((pay & 0xff_ffff) as u64, (pay >> 24) as usize);
             if o.cat_rev[cat] == 0 {
                 o.touched.push(cat as u32);
