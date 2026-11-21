@@ -545,7 +545,7 @@ fn dedup(keys: &[&[EvKey]], pays: &[&[Ev2]], table: &mut Vec<TLine>, dropped: &m
         for (c, chunk) in blk.chunks(64).enumerate() {
             let mut word = dropped[b << 4 | c];
             for e in chunk {
-                let keep = e.person != 0 && word & 1 == 0;
+                let keep = (e.person != 0) & (word & 1 == 0);
                 word >>= 1;
                 if keep {
                     out.push(person_part(e.person, bits), *e);
