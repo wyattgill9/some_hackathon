@@ -398,7 +398,7 @@ fn parse_event(l: &Line, ctx: &Ctx, cat_of: &U64Map, tc: &mut TsCache, e: &mut E
     let kind_ok = purchase
         || (kind.len() == 4 && {
             let k = u32::from_le_bytes(kind.try_into().unwrap());
-            k == u32::from_le_bytes(*b"view") || k == u32::from_le_bytes(*b"cart")
+            (k == u32::from_le_bytes(*b"view")) | (k == u32::from_le_bytes(*b"cart"))
         });
     let product = l.get(5);
     let mut valid = !user.is_empty() && !product.is_empty() && kind_ok && t.is_some_and(|t| ing - t <= DAY);
