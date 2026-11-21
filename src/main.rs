@@ -1,22 +1,19 @@
 //! Shopping Sessions: reads $DATA_DIR, writes $OUTPUT_DIR/{user_daily,campaign_daily}/part-0.parquet.
 //! rules.md is the spec; the comments name the rule each step implements.
-#[allow(dead_code)]
 mod key;
-mod parse;
-#[allow(dead_code)]
 mod parquet;
+mod parse;
+mod u64map;
 
 use std::fs;
-use std::hash::BuildHasher;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
-use foldhash::HashMap;
-use arrow_array::{ArrayRef, Date32Array, Int64Array, RecordBatch, StringArray};
-use ::parquet::arrow::ArrowWriter;
+use key::Key;
+use parquet::{Column, Kind};
 use rayon::prelude::*;
+use u64map::U64Map;
 
 const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
@@ -25,9 +22,9 @@ const CHUNK: usize = 8 << 20;
 const NULL_CAT: u32 = u32::MAX;
 
 /// A parsed event line, before dedup. `keep` = the copy is valid and not late.
-struct Ev<'a> {
-    id: &'a [u8],
-    user: &'a [u8],
+struct Ev {
+    id: Key,
+    user: Key,
     ingest: i64,
     ts: i64,
     price: u32,
@@ -44,10 +41,10 @@ struct Sv {
 }
 
 /// A valid click: `key` = person << 32 | (ts - (window_start - 7d)).
-struct Ck<'a> {
+struct Ck {
     key: u64,
     camp: u32,
-    id: &'a [u8],
+    id: Key,
 }
 
 struct Sess {
@@ -92,13 +89,22 @@ fn main() {
     cats.sort_unstable();
     cats.dedup();
     let unknown = cats.binary_search(&&b"unknown"[..]).unwrap() as u32;
-    let cat_of: HashMap<&[u8], u32> =
-        products.iter().map(|[p, c]| (*p, cats.binary_search(c).unwrap() as u32)).collect();
+    let mut cat_of = U64Map::new(products.len());
+    for [p, c] in &products {
+        if !p.is_empty() {
+            cat_of.insert(key::pack(p), cats.binary_search(c).unwrap() as u32);
+        }
+    }
 
     // Campaigns: index, id, channel. `organic` is index ncamp.
     let campaigns_buf = fs::read(data.join("campaigns.csv")).unwrap();
     let campaigns: Vec<[&[u8]; 2]> = lines(body(&campaigns_buf)).filter_map(parse::fields::<2>).collect();
-    let camp_of: HashMap<&[u8], u32> = campaigns.iter().enumerate().map(|(i, [c, _])| (*c, i as u32)).collect();
+    let mut camp_of = U64Map::new(campaigns.len());
+    for (i, [c, _]) in campaigns.iter().enumerate() {
+        if !c.is_empty() {
+            camp_of.insert(key::pack(c), i as u32);
+        }
+    }
     let ncamp = campaigns.len();
 
     let links_buf = read_csvs(&data.join("links"));
@@ -107,8 +113,8 @@ fn main() {
     lap("read");
 
     // Links: union-find over interned IDs; each person is named by its byte-wise smallest ID.
-    let mut person_of: HashMap<&[u8], u32> = HashMap::default();
-    let mut names: Vec<&[u8]> = Vec::new();
+    let mut person_of = U64Map::new(links_buf.iter().map(|f| f.len()).sum::<usize>() / 12);
+    let mut names: Vec<Key> = Vec::new();
     let mut parent: Vec<u32> = Vec::new();
     for c in chunks(&links_buf) {
         for [a, b] in lines(c).filter_map(parse::fields::<2>) {
@@ -116,8 +122,9 @@ fn main() {
                 continue;
             }
             let [a, b] = [a, b].map(|id| {
-                *person_of.entry(id).or_insert_with(|| {
-                    names.push(id);
+                let k = key::pack(id);
+                person_of.get_or_insert_with(k, || {
+                    names.push(k);
                     parent.push(parent.len() as u32);
                     parent.len() as u32 - 1
                 })
@@ -128,13 +135,11 @@ fn main() {
     }
     for i in 0..parent.len() {
         let r = find(&mut parent, i as u32) as usize;
-        if names[i] < names[r] {
+        if key::cmp(names[i], names[r]).is_lt() {
             names[r] = names[i];
         }
     }
-    for p in person_of.values_mut() {
-        *p = parent[*p as usize];
-    }
+    person_of.map_values(|p| parent[p as usize]);
     lap("links");
 
     // Events 1: parse, and flag each copy valid-and-not-late up front (it is only acted on if kept).
@@ -146,51 +151,37 @@ fn main() {
     lap("events parse");
 
     // Events 2: dedup on exact event_id, keeping the smallest ingest_ts, then drop kept copies that fail.
-    let mut by_hash: Vec<(u64, u32)> = evs.par_iter().enumerate().map(|(i, e)| (hash(e.id), i as u32)).collect();
-    by_hash.par_sort_unstable();
-    let kept: Vec<u32> = by_hash
+    let mut by_id: Vec<(Key, u32)> = evs.par_iter().enumerate().map(|(i, e)| (e.id, i as u32)).collect();
+    by_id.par_sort_unstable();
+    let kept: Vec<u32> = by_id
         .par_chunk_by(|a, b| a.0 == b.0)
-        .flat_map_iter(|run| {
-            let mut best: Vec<u32> = Vec::new(); // one per distinct id in this hash run (almost always 1)
-            for &(_, i) in run {
-                match best.iter_mut().find(|b| evs[**b as usize].id == evs[i as usize].id) {
-                    Some(b) if evs[i as usize].ingest < evs[*b as usize].ingest => *b = i,
-                    Some(_) => {}
-                    None => best.push(i),
-                }
-            }
-            best.into_iter().filter(|&i| evs[i as usize].keep)
+        .filter_map(|run| {
+            let best = run.iter().map(|&(_, i)| i).min_by_key(|&i| evs[i as usize].ingest).unwrap();
+            evs[best as usize].keep.then_some(best)
         })
         .collect();
-    drop(by_hash);
+    drop(by_id);
     lap("events dedup");
 
-    // People: group surviving events by user (hash, then exact bytes) so each distinct user is resolved once.
+    // People: group surviving events by user so each distinct user is resolved once.
     // A user_id not in any link is a person of its own, with a fresh id.
-    let mut by_user: Vec<(u64, u32)> = kept.par_iter().map(|&i| (hash(evs[i as usize].user), i)).collect();
+    let mut by_user: Vec<(Key, u32)> = kept.par_iter().map(|&i| (evs[i as usize].user, i)).collect();
     drop(kept);
     by_user.par_sort_unstable();
     let next = AtomicU32::new(names.len() as u32);
-    let (mut sv, new_ids): (Vec<Sv>, Vec<(u32, &[u8])>) = by_user
+    let (mut sv, new_ids): (Vec<Sv>, Vec<(u32, Key)>) = by_user
         .par_chunk_by(|a, b| a.0 == b.0)
         .fold(
             || (Vec::new(), Vec::new()),
-            |(mut sv, mut new_ids): (Vec<Sv>, Vec<(u32, &[u8])>), run| {
-                let mut seen: Vec<(&[u8], u32)> = Vec::new(); // distinct users in this hash run (almost always 1)
+            |(mut sv, mut new_ids): (Vec<Sv>, Vec<(u32, Key)>), run| {
+                let user = run[0].0;
+                let p = person_of.get(user).unwrap_or_else(|| {
+                    let p = next.fetch_add(1, Ordering::Relaxed);
+                    new_ids.push((p, user));
+                    p
+                });
                 for &(_, i) in run {
                     let e = &evs[i as usize];
-                    let p = match seen.iter().find(|s| s.0 == e.user) {
-                        Some(s) => s.1,
-                        None => {
-                            let p = person_of.get(e.user).copied().unwrap_or_else(|| {
-                                let p = next.fetch_add(1, Ordering::Relaxed);
-                                new_ids.push((p, e.user));
-                                p
-                            });
-                            seen.push((e.user, p));
-                            p
-                        }
-                    };
                     sv.push(Sv { key: (p as u64) << 32 | (e.ts - ws) as u64, price: e.price, cat: e.cat });
                 }
                 (sv, new_ids)
@@ -206,7 +197,7 @@ fn main() {
         );
     drop(by_user);
     drop(evs);
-    names.resize(next.into_inner() as usize, &[]);
+    names.resize(next.into_inner() as usize, 0);
     for (p, u) in new_ids {
         names[p as usize] = u;
         person_of.insert(u, p);
@@ -227,13 +218,13 @@ fn main() {
                 if id.is_empty() || user.is_empty() {
                     return None;
                 }
-                let camp = *camp_of.get(camp)?;
-                let p = *person_of.get(user)?;
-                Some(Ck { key: (p as u64) << 32 | (ts - cws) as u64, camp, id })
+                let camp = camp_of.get(key::pack(camp))?;
+                let p = person_of.get(key::pack(user))?;
+                Some(Ck { key: (p as u64) << 32 | (ts - cws) as u64, camp, id: key::pack(id) })
             })
         })
         .collect();
-    cks.par_sort_unstable_by(|a, b| a.key.cmp(&b.key).then(a.id.cmp(b.id)));
+    cks.par_sort_unstable_by(|a, b| a.key.cmp(&b.key).then(key::cmp(a.id, b.id)));
     lap("clicks");
 
     // Per person: sessionize, user_daily rows, then credit and assists for each session.
@@ -261,20 +252,34 @@ fn main() {
     lap("sessions + attribution");
 
     // Output.
-    let s = |b: &[u8]| std::str::from_utf8(b).unwrap().to_owned();
     let u = &acc.users;
-    write(
+    let (mut ids, mut tops, mut buf) = (Vec::new(), Vec::new(), Vec::new());
+    let mut present = Vec::with_capacity(u.len());
+    for r in u {
+        buf.clear();
+        key::decode(names[r.person as usize], &mut buf);
+        parquet::put_str(&mut ids, &buf);
+        present.push(r.top != NULL_CAT);
+        if r.top != NULL_CAT {
+            parquet::put_str(&mut tops, cats[r.top as usize]);
+        }
+    }
+    let mut top_body = parquet::def_levels(&present);
+    top_body.extend_from_slice(&tops);
+    let days: Vec<i32> = u.iter().map(|r| r.day).collect();
+    let sessions: Vec<i32> = u.iter().map(|r| r.sessions as i32).collect();
+    let events: Vec<i32> = u.iter().map(|r| r.events as i32).collect();
+    let revenue: Vec<i64> = u.iter().map(|r| r.rev).collect();
+    write_table(
         &out.join("user_daily"),
-        vec![
-            ("user_id", Arc::new(StringArray::from_iter_values(u.iter().map(|r| s(names[r.person as usize]))))),
-            ("day", Arc::new(Date32Array::from_iter_values(u.iter().map(|r| r.day)))),
-            ("sessions", Arc::new(Int64Array::from_iter_values(u.iter().map(|r| r.sessions)))),
-            ("events", Arc::new(Int64Array::from_iter_values(u.iter().map(|r| r.events)))),
-            ("revenue_cents", Arc::new(Int64Array::from_iter_values(u.iter().map(|r| r.rev)))),
-            (
-                "top_category",
-                Arc::new(StringArray::from_iter(u.iter().map(|r| (r.top != NULL_CAT).then(|| s(cats[r.top as usize]))))),
-            ),
+        u.len(),
+        &[
+            Column { name: "user_id", kind: Kind::Str, optional: false, body: &ids },
+            Column { name: "day", kind: Kind::Date, optional: false, body: parquet::plain(&days) },
+            Column { name: "sessions", kind: Kind::Int32, optional: false, body: parquet::plain(&sessions) },
+            Column { name: "events", kind: Kind::Int32, optional: false, body: parquet::plain(&events) },
+            Column { name: "revenue_cents", kind: Kind::Int64, optional: false, body: parquet::plain(&revenue) },
+            Column { name: "top_category", kind: Kind::Str, optional: true, body: &top_body },
         ],
     );
     let cells: Vec<(usize, usize, [i64; 4])> = (0..=ncamp)
@@ -282,27 +287,36 @@ fn main() {
         .map(|(c, d)| (c, d, acc.camp[c * ndays + d]))
         .filter(|(_, _, v)| v[0] > 0 || v[3] > 0)
         .collect();
-    let id = |c: usize| if c == ncamp { "organic".to_owned() } else { s(campaigns[c][0]) };
-    let chan = |c: usize| if c == ncamp { "organic".to_owned() } else { s(campaigns[c][1]) };
-    let col = |k: usize| Arc::new(Int64Array::from_iter_values(cells.iter().map(|v| v.2[k]))) as ArrayRef;
-    write(
+    let (mut cid, mut chan) = (Vec::new(), Vec::new());
+    for &(c, _, _) in &cells {
+        let [i, h] = if c == ncamp { [&b"organic"[..]; 2] } else { campaigns[c] };
+        parquet::put_str(&mut cid, i);
+        parquet::put_str(&mut chan, h);
+    }
+    let cdays: Vec<i32> = cells.iter().map(|v| (day0 + v.1 as i64) as i32).collect();
+    let col = |k: usize| cells.iter().map(|v| v.2[k]).collect::<Vec<i64>>();
+    let (c0, c1, c2, c3) = (col(0), col(1), col(2), col(3));
+    write_table(
         &out.join("campaign_daily"),
-        vec![
-            ("campaign_id", Arc::new(StringArray::from_iter_values(cells.iter().map(|v| id(v.0))))),
-            ("channel", Arc::new(StringArray::from_iter_values(cells.iter().map(|v| chan(v.0))))),
-            ("day", Arc::new(Date32Array::from_iter_values(cells.iter().map(|v| (day0 + v.1 as i64) as i32)))),
-            ("sessions", col(0)),
-            ("purchasing_sessions", col(1)),
-            ("revenue_cents", col(2)),
-            ("assisted_sessions", col(3)),
+        cells.len(),
+        &[
+            Column { name: "campaign_id", kind: Kind::Str, optional: false, body: &cid },
+            Column { name: "channel", kind: Kind::Str, optional: false, body: &chan },
+            Column { name: "day", kind: Kind::Date, optional: false, body: parquet::plain(&cdays) },
+            Column { name: "sessions", kind: Kind::Int64, optional: false, body: parquet::plain(&c0) },
+            Column { name: "purchasing_sessions", kind: Kind::Int64, optional: false, body: parquet::plain(&c1) },
+            Column { name: "revenue_cents", kind: Kind::Int64, optional: false, body: parquet::plain(&c2) },
+            Column { name: "assisted_sessions", kind: Kind::Int64, optional: false, body: parquet::plain(&c3) },
         ],
     );
     let (us, ur) = u.iter().fold((0, 0), |(a, b), r| (a + r.sessions, b + r.rev));
     let (cs, cr) = cells.iter().fold((0, 0), |(a, b), v| (a + v.2[0], b + v.2[2]));
     lap(&format!("write: {} user rows, {} campaign rows; sessions {us}/{cs}, revenue {ur}/{cr}", u.len(), cells.len()));
+    // Nothing is freed: the kernel reclaims the gigabytes at exit faster than Rust drops them.
+    std::process::exit(0);
 }
 
-fn parse_event<'a>(l: &'a [u8], ws: i64, we: i64, cat_of: &HashMap<&[u8], u32>, unknown: u32) -> Option<Ev<'a>> {
+fn parse_event(l: &[u8], ws: i64, we: i64, cat_of: &U64Map, unknown: u32) -> Option<Ev> {
     let [id, user, ts, ingest, kind, product, price] = parse::fields::<7>(l)?;
     if id.is_empty() {
         return None;
@@ -317,11 +331,11 @@ fn parse_event<'a>(l: &'a [u8], ws: i64, we: i64, cat_of: &HashMap<&[u8], u32>, 
     let (mut p, mut cat) = (0, 0);
     if keep && kind == b"purchase" {
         match parse::price(price) {
-            Some(v) => (p, cat) = (v, *cat_of.get(product).unwrap_or(&unknown)),
+            Some(v) => (p, cat) = (v, cat_of.get(key::pack(product)).unwrap_or(unknown)),
             None => keep = false,
         }
     }
-    Some(Ev { id, user, ingest, ts: ts.unwrap_or(0), price: p, cat, keep })
+    Some(Ev { id: key::pack(id), user: key::pack(user), ingest, ts: ts.unwrap_or(0), price: p, cat, keep })
 }
 
 /// Reusable per-thread buffers.
@@ -455,10 +469,6 @@ fn find(parent: &mut [u32], mut x: u32) -> u32 {
     x
 }
 
-fn hash(b: &[u8]) -> u64 {
-    foldhash::fast::FixedState::default().hash_one(b)
-}
-
 fn manifest_ts(m: &[u8], key: &str) -> i64 {
     let key = format!("\"{key}\"");
     let at = m.windows(key.len()).position(|w| w == key.as_bytes()).unwrap() + key.len();
@@ -504,10 +514,7 @@ fn lines(c: &[u8]) -> impl Iterator<Item = &[u8]> {
     c.strip_suffix(b"\n").unwrap_or(c).split(|&b| b == b'\n').filter(|_| !c.is_empty())
 }
 
-fn write(dir: &Path, cols: Vec<(&str, ArrayRef)>) {
+fn write_table(dir: &Path, rows: usize, cols: &[Column]) {
     fs::create_dir_all(dir).unwrap();
-    let batch = RecordBatch::try_from_iter(cols).unwrap();
-    let mut w = ArrowWriter::try_new(fs::File::create(dir.join("part-0.parquet")).unwrap(), batch.schema(), None).unwrap();
-    w.write(&batch).unwrap();
-    w.close().unwrap();
+    parquet::write(&dir.join("part-0.parquet"), rows, cols).unwrap();
 }
