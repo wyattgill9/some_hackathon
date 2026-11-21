@@ -26,6 +26,14 @@ pub struct Cell {
     pub revenue: i64,
 }
 
+/// The credited part of a cell, 16 bytes: what every session updates.
+#[derive(Clone, Copy, Default)]
+struct Credit {
+    sessions: u32,
+    purchasing: u32,
+    revenue: i64,
+}
+
 /// user_daily rows as columns: strings as lengths and bytes, `present` as packed bits.
 #[derive(Default)]
 pub struct Rows {
@@ -64,8 +72,8 @@ struct Out {
     id: [u8; 16],
     cat16: Vec<[u8; 16]>,
     rows: Rows,
-    cells: Vec<Cell>,
-    /// `[campaign][day]` assisted sessions; merged into `cells` at the end.
+    /// `[campaign][day]` credits and assisted sessions; `organic` is campaign `ncamp`, which never assists.
+    cells: Vec<Credit>,
     assisted: Vec<u32>,
 }
 
@@ -138,7 +146,7 @@ impl<'a> Worker<'a> {
                 rows: Rows::default(),
                 // Written pages, not calloc: these are read-modify-written, and a calloc page read first
                 // maps the zero page, whose copy-on-write flushes every thread's TLB.
-                cells: mem::zeroed((ctx.ncamp + 1) * ctx.ndays),
+                cells: mem::zeroed::<Credit>((ctx.ncamp + 1) * ctx.ndays),
                 assisted: mem::zeroed(ctx.ncamp * ctx.ndays),
             },
         }
@@ -153,8 +161,17 @@ impl<'a> Worker<'a> {
             return;
         }
         let cblocks: Vec<&[Ck]> = cks.collect();
-        // Local index: person key -> dense local id, built from the events; clicks only look up. A table that
-        // fills past half is abandoned and the partition indexed again in one four times larger.
+        // Events are never sorted: a counting sort by bin, then a stable one by person, leaves each person's
+        // events in bin order, which is all the session walk needs. The bin scatter also builds the local
+        // index (person key -> dense local id; clicks only look up) and tags each record with its id. A table
+        // that fills past half is abandoned and the partition scattered again into one four times larger.
+        self.bcounts.clear();
+        self.bcounts.resize(self.nbins, 0);
+        for e in eblocks.iter().flat_map(|b| b.iter()) {
+            // In bounds: the bin comes from a ts inside the window.
+            unsafe { *self.bcounts.get_unchecked_mut((e.ts >> BIN) as usize) += 1 };
+        }
+        prefix(&self.bcounts, &mut self.boffs);
         let est = if self.ev_seen == 0 { n / 4 } else { n * self.np_seen / self.ev_seen + n / 32 };
         let mut cap = (est * 2 + 2).next_power_of_two().max(1024);
         let np = loop {
@@ -169,31 +186,6 @@ impl<'a> Worker<'a> {
         };
         self.ev_seen += n;
         self.np_seen += np;
-        // Events are never sorted: a counting sort by 30-minute bin, then a stable one by person, leaves each
-        // person's events in bin order, which is all the session walk needs.
-        prefix(&self.bcounts, &mut self.boffs);
-        self.cursor.clear();
-        self.cursor.extend_from_slice(&self.boffs[..self.nbins]);
-        self.tmp.clear();
-        self.tmp.reserve(n);
-        self.tmp_li.clear();
-        self.tmp_li.reserve(n);
-        // The scatters write every one of the n reserved slots exactly once; indices stay in bounds by
-        // construction (bins from the window, local ids from the index).
-        unsafe {
-            let (tmp, tli, cur, lis) = (self.tmp.as_mut_ptr(), self.tmp_li.as_mut_ptr(), self.cursor.as_mut_ptr(), self.lis.as_ptr());
-            let mut k = 0;
-            for e in eblocks.iter().flat_map(|b| b.iter()) {
-                let c = cur.add((e.ts >> BIN) as usize);
-                let p = *c as usize;
-                *c += 1;
-                *tmp.add(p) = (e.ts as u64) << 32 | e.pay as u64;
-                *tli.add(p) = *lis.add(k);
-                k += 1;
-            }
-            self.tmp.set_len(n);
-            self.tmp_li.set_len(n);
-        }
         self.offs.clear();
         self.offs.push(0);
         let mut acc = 0;
@@ -295,23 +287,24 @@ impl<'a> Worker<'a> {
         }
     }
 
-    /// Fills the index, `lis` (local id per event) and `bcounts` from the events: the number of persons, or
-    /// None (and a cleared table) when the table got half full.
+    /// Scatters the events by bin into `tmp` (`ts << 32 | pay`) and `tmp_li` (local id), building the index:
+    /// the number of persons, or None (and a cleared table) when the table got half full.
     fn index(&mut self, eblocks: &[&[Ev2]], n: usize) -> Option<usize> {
         let cap = self.table.len();
         let (mask, shift) = (cap - 1, 64 - cap.trailing_zeros());
         self.persons.clear();
         self.persons.reserve(cap / 2);
-        self.bcounts.clear();
-        self.bcounts.resize(self.nbins, 0);
-        self.lis.clear();
-        self.lis.reserve(n);
+        self.cursor.clear();
+        self.cursor.extend_from_slice(&self.boffs[..self.nbins]);
+        self.tmp.clear();
+        self.tmp.reserve(n);
+        self.tmp_li.clear();
+        self.tmp_li.reserve(n);
         let mut np = 0usize;
-        // Every event writes one `lis` slot, every new person (at most cap / 2) one `persons` slot; bins come
-        // from the window, probes wrap within the table.
+        // Every event writes one of the n reserved slots (bins from the window, counted above), every new
+        // person (at most cap / 2) one `persons` slot; probes wrap within the table.
         let full = unsafe {
-            let (t, lis, bc, ps) = (self.table.as_mut_ptr(), self.lis.as_mut_ptr(), self.bcounts.as_mut_ptr(), self.persons.as_mut_ptr());
-            let mut k = 0;
+            let (t, tmp, tli, cur, ps) = (self.table.as_mut_ptr(), self.tmp.as_mut_ptr(), self.tmp_li.as_mut_ptr(), self.cursor.as_mut_ptr(), self.persons.as_mut_ptr());
             let mut full = false;
             'all: for e in eblocks.iter().flat_map(|b| b.iter()) {
                 let mut i = (e.person.wrapping_mul(HASH) >> shift) as usize;
@@ -333,11 +326,16 @@ impl<'a> Worker<'a> {
                     }
                     i = (i + 1) & mask;
                 };
-                *lis.add(k) = li;
-                k += 1;
-                *bc.add((e.ts >> BIN) as usize) += 1;
+                let c = cur.add((e.ts >> BIN) as usize);
+                let p = *c as usize;
+                *c += 1;
+                *tmp.add(p) = (e.ts as u64) << 32 | e.pay as u64;
+                *tli.add(p) = li;
             }
-            self.lis.set_len(k);
+            if !full {
+                self.tmp.set_len(n);
+                self.tmp_li.set_len(n);
+            }
             self.persons.set_len(np);
             full
         };
@@ -351,14 +349,13 @@ impl<'a> Worker<'a> {
     }
 
     /// The campaign cells, the user_daily row count and the encoded user_daily file.
-    pub fn finish(mut self) -> (Vec<Cell>, usize, UserFile) {
-        for (c, &a) in self.out.cells.iter_mut().zip(&self.out.assisted) {
-            c.assisted = a;
-        }
+    pub fn finish(self) -> (Vec<Cell>, usize, UserFile) {
+        let assisted = self.out.assisted.iter().copied().chain(std::iter::repeat(0));
+        let cells = self.out.cells.iter().zip(assisted).map(|(c, a)| Cell { sessions: c.sessions, purchasing: c.purchasing, assisted: a, revenue: c.revenue }).collect();
         let r = self.out.rows;
         let d = parquet::delta::<i32>;
         let enc = [d(&r.idlen), d(&r.day), d(&r.sessions), d(&r.events), parquet::delta(&r.revenue), parquet::def_levels(&r.present, r.n), d(&r.toplen)];
-        (self.out.cells, r.n, UserFile { rows: r, enc })
+        (cells, r.n, UserFile { rows: r, enc })
     }
 }
 
