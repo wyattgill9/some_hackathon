@@ -41,12 +41,15 @@ impl<T: Copy> Pool<T> {
 
     #[inline(always)]
     pub fn push(&mut self, p: usize, v: T) {
-        let f = self.fill[p] as usize;
-        self.stage[p][f] = v;
-        if f + 1 == STAGE {
-            self.flush(p);
-        } else {
-            self.fill[p] = f as u8 + 1;
+        // In bounds: p comes from the partition bits, and fill stays below STAGE.
+        unsafe {
+            let f = *self.fill.get_unchecked(p) as usize;
+            *self.stage.get_unchecked_mut(p).get_unchecked_mut(f) = v;
+            if f + 1 == STAGE {
+                self.flush(p);
+            } else {
+                *self.fill.get_unchecked_mut(p) = f as u8 + 1;
+            }
         }
     }
 

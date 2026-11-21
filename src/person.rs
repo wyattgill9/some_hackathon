@@ -75,8 +75,6 @@ struct Out {
 
 pub struct Worker<'a> {
     ctx: &'a Ctx,
-    ev: Vec<Ev2>,
-    ck: Vec<Ck>,
     keys: Vec<u64>,
     vals: Vec<u32>,
     lis: Vec<u32>,
@@ -95,8 +93,6 @@ impl<'a> Worker<'a> {
     pub fn new(ctx: &'a Ctx) -> Self {
         Worker {
             ctx,
-            ev: Vec::new(),
-            ck: Vec::new(),
             keys: Vec::new(),
             vals: Vec::new(),
             lis: Vec::new(),
@@ -122,18 +118,13 @@ impl<'a> Worker<'a> {
 
     /// Processes one partition, given its events and clicks from every parse thread.
     pub fn run<'e, 'c>(&mut self, evs: impl Iterator<Item = &'e [Ev2]>, cks: impl Iterator<Item = &'c [Ck]>) {
-        self.ev.clear();
-        for s in evs {
-            self.ev.extend_from_slice(s);
-        }
-        let n = self.ev.len();
+        // The blocks are read in place, twice each: once to count, once to scatter.
+        let eblocks: Vec<&[Ev2]> = evs.collect();
+        let n: usize = eblocks.iter().map(|b| b.len()).sum();
         if n == 0 {
             return;
         }
-        self.ck.clear();
-        for s in cks {
-            self.ck.extend_from_slice(s);
-        }
+        let cblocks: Vec<&[Ck]> = cks.collect();
         // Local index: person key -> dense local id, built from the events; clicks only look up.
         let cap = (n * 2).next_power_of_two().max(16);
         let (mask, shift) = (cap - 1, 64 - cap.trailing_zeros());
@@ -144,7 +135,7 @@ impl<'a> Worker<'a> {
         self.persons.clear();
         self.counts.clear();
         self.lis.clear();
-        for e in &self.ev {
+        for e in eblocks.iter().flat_map(|b| b.iter()) {
             let mut i = ((mix(e.person) << bits) >> shift) as usize;
             while self.keys[i] != 0 && self.keys[i] != e.person {
                 i = (i + 1) & mask;
@@ -165,7 +156,7 @@ impl<'a> Worker<'a> {
         self.cursor.extend_from_slice(&self.offs[..np]);
         self.sorted.clear();
         self.sorted.resize(n, 0);
-        for (e, &li) in self.ev.iter().zip(&self.lis) {
+        for (e, &li) in eblocks.iter().flat_map(|b| b.iter()).zip(&self.lis) {
             let c = &mut self.cursor[li as usize];
             self.sorted[*c as usize] = (e.ts as u64) << 32 | e.pay as u64;
             *c += 1;
@@ -174,7 +165,7 @@ impl<'a> Worker<'a> {
         self.ccounts.clear();
         self.ccounts.resize(np, 0);
         self.lis.clear();
-        for c in &self.ck {
+        for c in cblocks.iter().flat_map(|b| b.iter()) {
             let mut i = ((mix(c.person) << bits) >> shift) as usize;
             while self.keys[i] != 0 && self.keys[i] != c.person {
                 i = (i + 1) & mask;
@@ -190,7 +181,7 @@ impl<'a> Worker<'a> {
         self.cursor.extend_from_slice(&self.coffs[..np]);
         self.csorted.clear();
         self.csorted.resize(self.coffs[np] as usize, [0; 2]);
-        for (c, &li) in self.ck.iter().zip(&self.lis) {
+        for (c, &li) in cblocks.iter().flat_map(|b| b.iter()).zip(&self.lis) {
             if li != NONE {
                 let k = &mut self.cursor[li as usize];
                 self.csorted[*k as usize] = [(c.ts as u64) << 32 | c.camp as u64, c.cid];
