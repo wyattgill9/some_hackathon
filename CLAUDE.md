@@ -8,7 +8,9 @@ A Databricks Buildathon entry for "Shopping Sessions": clean dirty click-stream 
 
 ## Repo state
 
-**Engine: one Rust binary** (`Cargo.toml`, `src/main.rs` pipeline, `src/parse.rs` dialect/timestamp parsers with unit tests). The root `Dockerfile` builds it in `rust:1-slim-bookworm` (`target-cpu=x86-64-v3`) and runs it from `debian:bookworm-slim`. It reads `DATA_DIR`/`OUTPUT_DIR`/`NCPU` from the env and logs per-phase timings and the self-check to stderr.
+**Engine: one zero-dependency Rust binary**, static, in a `FROM scratch` image (`Dockerfile`, `target-cpu=x86-64-v3`). Phases (`src/main.rs`): `reader.rs` (256 KiB `pread` ranges; `scan.rs` AVX2 index of `\n , "`; field walk) → `links.rs` (parallel CAS union-find; (id, name) table prefetched 16 lines ahead) → parse into hash partitions through `pool.rs` (write-combining blocks on huge pages; `Ev` by event_id, `Ck` by person) → dedup per partition → `person.rs` per person partition (counting sort, sessions, attribution, per-worker `user_daily` file) → `campaign_daily`. `key.rs` packs IDs into order-preserving u64s (interned fallback), `ts.rs` has the timestamp fast paths, `parse.rs` the exact slow paths, `parquet.rs` the writer. It logs per-phase timings and the self-check to stderr. `competitors/TECHNIQUES.md` lists where the design comes from.
+
+`ref/` is the **frozen first implementation**, the oracle: `cargo build --release --manifest-path ref/Cargo.toml`, then `scripts/diff_vs_ref.sh "2 3 4 5 15" 1000000` diffs the pipeline against it on generated seeds (NCPU 1/3/8, `SS_RANGE`, `SS_PBITS` overrides). Never edit `ref/`.
 - `Makefile`, `scripts/`, `fixtures/` (the 36 cases), `.dockerignore`: the shared starter harness. It is identical in all three starters.
 - `starters/{duckdb,polars,pyspark}/`: each starter's engine-specific `Dockerfile`, `run.sh`, `pipeline/`, `requirements.txt` and README. The pyspark `run.sh`/README holds the JVM-in-container workarounds. Reference only; not used.
 - `generator/`: Rust source for `generate` (std only). The flake builds it with plain `rustc` because its `Cargo.lock` is stale.
@@ -31,10 +33,13 @@ make dev                       # generate --seed 1 --events 1000000 --clicks 250
 make run-dev                   # timed run on dev/ -> out/   (CPUS=4 MEM=8g to lower limits)
 make check-dev ANSWER=dev-answer   # exact diff of out/ vs unzipped dev-answer
 
-# Native (no Docker): build, unit tests, fixtures, dev diff
+# Native (no Docker): build, unit tests, fixtures, dev diff, reference diffs, benchmark (4 cores + SMT, like the scorer)
 cargo build --release && cargo test --release
 python3 scripts/run_fixtures.py fixtures -- target/release/pipeline
-rm -rf out && DATA_DIR=dev OUTPUT_DIR=out target/release/pipeline && python3 scripts/compare.py out dev-answer
+rm -rf out-dev && DATA_DIR=dev OUTPUT_DIR=out-dev target/release/pipeline && python3 scripts/compare.py out-dev dev-answer
+scripts/diff_vs_ref.sh "2 3 4 5 15" 1000000
+scripts/bench.sh ~/data/ss20m 5
+python3 scripts/check_parquet.py out-dev        # the output through polars, pyarrow and duckdb
 
 # Without Docker: all fixtures, or one fixture
 python3 scripts/run_fixtures.py fixtures -- <cmd>     # cmd gets DATA_DIR/OUTPUT_DIR as env AND as the last two args
@@ -43,7 +48,7 @@ DATA_DIR=fixtures/E16/input OUTPUT_DIR=out <cmd> && python3 scripts/compare.py o
 
 `compare.py` diffs any two folders. Each side can be `<table>.csv` files or `<table>/*.parquet` dirs. Integer columns may be any width, and `day` must be a Parquet `DATE`. `scripts/docker_run.sh DATA OUT` reproduces the scorer's exact `docker run` flags. Without a Docker daemon, rootless podman works: `nix shell nixpkgs#podman`, put a `docker` shim (`exec podman "$@"`) first on PATH, and build with `podman build --signature-policy <file with {"default":[{"type":"insecureAcceptAnything"}]}>` and `CONTAINERS_REGISTRIES_CONF` set to a file with `unqualified-search-registries = ["docker.io"]`.
 
-Larger local sets live outside the repo in `~/data/` (`ss20m` seed 2, `ss60m` seed 3, `ssfeb29` seed 15, whose window holds Feb 29, 2028). They have no answers, so check them with the self-check line and exit 0.
+Larger local sets live outside the repo in `~/data/` (`ss20m` seed 2, `ss60m` seed 3, `ssfeb29` seed 15, whose window holds Feb 29, 2028); `~/data/<set>.ref` holds the oracle's output for them, so `compare.py` can diff the pipeline at full size. Container runs leave files owned by a mapped uid: clean with `podman unshare rm -rf`.
 
 ## Scorer / container constraints
 
