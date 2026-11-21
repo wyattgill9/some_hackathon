@@ -3,6 +3,7 @@
 //! (by event_id, by person) -> dedup per event partition -> sessions and attribution per person partition.
 mod key;
 mod links;
+mod mem;
 mod parquet;
 mod parse;
 mod person;
@@ -17,11 +18,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use key::{Key, mix};
-use parquet::{Column, Kind};
+use key::Key;
+use parquet::{Column, Enc, Kind};
 use person::Cell;
 use pool::Pool;
-use reader::{Line, Range, Reader};
+use reader::{Fields, Handler, Range, Reader};
 use ts::TsCache;
 use u64map::U64Map;
 
@@ -83,7 +84,18 @@ pub struct Ctx {
 
 fn main() {
     let t0 = Instant::now();
-    let lap = |what: &str| eprintln!("{:>8.3}s {what}", t0.elapsed().as_secs_f64());
+    // Never trim malloc heaps: a thread's freed memory would be given back (MADV_DONTNEED) and then re-faulted by
+    // the next phase's thread on the same arena, page by page, each fault flushing every thread's TLB (20M
+    // events: 16k faults and 11k TLB-shootdown IPIs). Freed memory simply stays resident for the next phase.
+    unsafe extern "C" {
+        fn mallopt(param: i32, value: i32) -> i32;
+    }
+    const M_TRIM_THRESHOLD: i32 = -1;
+    unsafe { mallopt(M_TRIM_THRESHOLD, i32::MAX) };
+    let lap = |what: &str| {
+        let (u, s, f) = rusage();
+        eprintln!("{:>8.3}s (user {u:.3} sys {s:.3} faults {f}) {what}", t0.elapsed().as_secs_f64());
+    };
     let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok());
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or("/output".into()));
@@ -142,7 +154,9 @@ fn main() {
     // Partitions of about 2 MiB of CSV each: every later phase works on one in cache.
     let bits = env("SS_PBITS").map_or(((event_bytes >> 21).next_power_of_two().trailing_zeros()).clamp(4, 11), |b| b as u32);
     let parts = 1usize << bits;
-    let range = env("SS_RANGE").unwrap_or(256 << 10);
+    // 128 KiB ranges: a thread's read buffer plus its open partition stages must share a 1 MiB L2 with its
+    // SMT sibling on the scorer (neutral on a private-L2 desktop).
+    let range = env("SS_RANGE").unwrap_or(128 << 10);
     let ctx = Ctx { ws, we, cws, day0, ndays, bits, ncamp, cats: cats.iter().map(|c| c.to_vec()).collect(), unknown };
     fs::create_dir_all(out.join("user_daily")).unwrap();
     fs::create_dir_all(out.join("campaign_daily")).unwrap();
@@ -152,19 +166,11 @@ fn main() {
     let link_ranges = reader::ranges(&link_files, range);
     let next = AtomicUsize::new(0);
     let edges: Vec<Vec<(Key, Key)>> = parallel(threads, |_| {
-        let (mut rd, mut out) = (Reader::default(), Vec::new());
+        let (mut rd, mut out) = (Reader::default(), LinkLines(Vec::new()));
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
-            let Some(r) = link_ranges.get(i) else { break out };
-            rd.fields::<2>(&link_files[r.file].0, r, |l| {
-                let (a, b) = (l.get(0), l.get(1));
-                if !a.is_empty() && !b.is_empty() {
-                    let (ka, kb) = (key::pack(a), key::pack(b));
-                    if ka != kb {
-                        out.push((ka, kb));
-                    }
-                }
-            });
+            let Some(r) = link_ranges.get(i) else { break out.0 };
+            rd.fields::<2>(&link_files[r.file].0, r, &mut out);
         }
     });
     let links = links::Links::build(&edges, threads);
@@ -176,46 +182,29 @@ fn main() {
     tasks.extend(reader::ranges(&click_files, range).into_iter().map(|r| (false, r)));
     let next = AtomicUsize::new(0);
     let parsed: Vec<(Pool<EvKey, EV_STAGE>, Pool<Ev2, EV_STAGE>, Pool<Ck, CK_STAGE>)> = parallel(threads, |_| {
-        let (mut rd, mut tc) = (Reader::default(), TsCache::default());
-        let mut evs = (Pool::<EvKey, EV_STAGE>::new(parts), Pool::<Ev2, EV_STAGE>::new(parts));
-        let mut cks = Pool::<Ck, CK_STAGE>::new(parts);
-        // Records wait in a ring while the link-table line of their user ID is prefetched; the lookup happens
-        // PIPE lines later, by which time the line has arrived.
-        let (mut epipe, mut cpipe) = (Pipe::<Ev>::default(), Pipe::<Ck>::default());
+        let mut rd = Reader::default();
+        let mut w = Parser {
+            ctx: &ctx,
+            cat_of: &cat_of,
+            camp_of: &camp_of,
+            camp_num: &camp_num,
+            links: &links,
+            tc: TsCache::default(),
+            evs: (Pool::new(parts), Pool::new(parts)),
+            cks: Pool::new(parts),
+            epipe: Pipe::default(),
+            cpipe: Pipe::default(),
+        };
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             let Some((is_event, r)) = tasks.get(i) else { break };
             if *is_event {
-                rd.fields::<7>(&event_files[r.file].0, r, |l| {
-                    let (slot, old) = epipe.slot();
-                    if parse_event(l, &ctx, &cat_of, &mut tc, slot) {
-                        let user = slot.pay.person;
-                        links.prefetch(user);
-                        if let Some(old) = epipe.advance(old) {
-                            emit_ev(old, &links, bits, &mut evs);
-                        }
-                    }
-                });
+                rd.fields::<7>(&event_files[r.file].0, r, &mut w);
             } else {
-                rd.fields::<4>(&click_files[r.file].0, r, |l| {
-                    if let Some(c) = parse_click(l, &ctx, &camp_of, &camp_num, &mut tc) {
-                        links.prefetch(c.person);
-                        if let Some(old) = cpipe.push(c) {
-                            emit_ck(old, &links, bits, &mut cks);
-                        }
-                    }
-                });
+                rd.fields::<4>(&click_files[r.file].0, r, &mut w);
             }
         }
-        for e in epipe.drain() {
-            emit_ev(e, &links, bits, &mut evs);
-        }
-        for c in cpipe.drain() {
-            emit_ck(c, &links, bits, &mut cks);
-        }
-        evs.0.finish2(&mut evs.1);
-        cks.finish();
-        (evs.0, evs.1, cks)
+        w.finish()
     });
     let (mut evk, mut evp, mut cks) = (Vec::new(), Vec::new(), Vec::new());
     for (k, p, c) in parsed {
@@ -224,7 +213,6 @@ fn main() {
         cks.push(c);
     }
     lap("parse");
-
     // Dedup per event partition: keep the copy with the smallest ingest_ts, emit it if valid, by person. The
     // output blocks are carved from the partition's consumed input blocks.
     let next = AtomicUsize::new(0);
@@ -248,72 +236,102 @@ fn main() {
     });
     lap("dedup");
 
-    // People per person partition, largest first; each worker writes its own user_daily file.
+    // People per person partition, largest first; each worker writes its own user_daily file. Its cells and
+    // row count go to the main thread first, which writes campaign_daily while the user files are written.
     let mut order: Vec<usize> = (0..parts).collect();
     order.sort_by_key(|&q| std::cmp::Reverse(ev2.iter().map(|t| t.len(q)).sum::<usize>()));
     let next = AtomicUsize::new(0);
-    let results: Vec<(Vec<Cell>, usize)> = parallel(threads, |t| {
-        let mut w = person::Worker::new(&ctx);
-        loop {
-            let i = next.fetch_add(1, Ordering::Relaxed);
-            let Some(&q) = order.get(i) else { break };
-            w.run(ev2.iter().flat_map(|t| t.blocks(q)), cks.iter().flat_map(|t| t.blocks(q)));
+    let (tx, rx) = std::sync::mpsc::channel::<(Vec<Cell>, usize)>();
+    let (rows, cs, cr, nrows) = std::thread::scope(|s| {
+        for t in 0..threads {
+            let (tx, ctx, out, ev2, cks, order, next) = (tx.clone(), &ctx, &out, &ev2, &cks, &order, &next);
+            s.spawn(move || {
+                let mut w = person::Worker::new(ctx);
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(&q) = order.get(i) else { break };
+                    w.run(ev2.iter().flat_map(|t| t.blocks(q)), cks.iter().flat_map(|t| t.blocks(q)));
+                }
+                let (cells, n, cols) = w.finish();
+                tx.send((cells, n)).unwrap();
+                cols.write(&out.join("user_daily").join(format!("part-{t}.parquet")));
+            });
         }
-        w.finish(&out.join("user_daily").join(format!("part-{t}.parquet")))
+        drop(tx);
+        // campaign_daily: the threads' cells summed; a row wherever a campaign credited or assisted a session.
+        let (mut cells, mut rows) = (mem::zeroed::<Cell>((ncamp + 1) * ndays), 0);
+        for (c, n) in rx {
+            rows += n;
+            for (a, b) in cells.iter_mut().zip(&c) {
+                a.sessions += b.sessions;
+                a.purchasing += b.purchasing;
+                a.assisted += b.assisted;
+                a.revenue += b.revenue;
+            }
+        }
+        let (mut cid, mut chan, mut days) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut c0, mut c1, mut c2, mut c3) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for (i, cell) in cells.iter().enumerate() {
+            if cell.sessions == 0 && cell.assisted == 0 {
+                continue;
+            }
+            let (c, d) = (i / ndays, i % ndays);
+            let [id, ch] = if c == ncamp { [&b"organic"[..]; 2] } else { campaigns[c] };
+            parquet::put_str(&mut cid, id);
+            parquet::put_str(&mut chan, ch);
+            days.push((day0 + d as i64) as i32);
+            c0.push(cell.sessions as i64);
+            c1.push(cell.purchasing as i64);
+            c2.push(cell.revenue);
+            c3.push(cell.assisted as i64);
+        }
+        let plain = |kind, name, body| Column { name, kind, enc: Enc::Plain, optional: false, parts: body };
+        parquet::write(
+            &out.join("campaign_daily").join("part-0.parquet"),
+            days.len(),
+            &[
+                plain(Kind::Str, "campaign_id", &[&cid]),
+                plain(Kind::Str, "channel", &[&chan]),
+                plain(Kind::Date, "day", &[parquet::plain(&days)]),
+                plain(Kind::Int64, "sessions", &[parquet::plain(&c0)]),
+                plain(Kind::Int64, "purchasing_sessions", &[parquet::plain(&c1)]),
+                plain(Kind::Int64, "revenue_cents", &[parquet::plain(&c2)]),
+                plain(Kind::Int64, "assisted_sessions", &[parquet::plain(&c3)]),
+            ],
+        )
+        .unwrap();
+        (rows, c0.iter().sum::<i64>(), c2.iter().sum::<i64>(), days.len())
     });
     lap("people");
-
-    // campaign_daily: the threads' cells summed; a row wherever a campaign credited or assisted a session.
-    let mut cells = vec![Cell::default(); (ncamp + 1) * ndays];
-    for (c, _) in &results {
-        for (a, b) in cells.iter_mut().zip(c) {
-            a.sessions += b.sessions;
-            a.purchasing += b.purchasing;
-            a.assisted += b.assisted;
-            a.revenue += b.revenue;
-        }
-    }
-    let (mut cid, mut chan, mut days) = (Vec::new(), Vec::new(), Vec::new());
-    let (mut c0, mut c1, mut c2, mut c3) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    for (i, cell) in cells.iter().enumerate() {
-        if cell.sessions == 0 && cell.assisted == 0 {
-            continue;
-        }
-        let (c, d) = (i / ndays, i % ndays);
-        let [id, ch] = if c == ncamp { [&b"organic"[..]; 2] } else { campaigns[c] };
-        parquet::put_str(&mut cid, id);
-        parquet::put_str(&mut chan, ch);
-        days.push((day0 + d as i64) as i32);
-        c0.push(cell.sessions as i64);
-        c1.push(cell.purchasing as i64);
-        c2.push(cell.revenue);
-        c3.push(cell.assisted as i64);
-    }
-    parquet::write(
-        &out.join("campaign_daily").join("part-0.parquet"),
-        days.len(),
-        &[
-            Column { name: "campaign_id", kind: Kind::Str, optional: false, body: &cid },
-            Column { name: "channel", kind: Kind::Str, optional: false, body: &chan },
-            Column { name: "day", kind: Kind::Date, optional: false, body: parquet::plain(&days) },
-            Column { name: "sessions", kind: Kind::Int64, optional: false, body: parquet::plain(&c0) },
-            Column { name: "purchasing_sessions", kind: Kind::Int64, optional: false, body: parquet::plain(&c1) },
-            Column { name: "revenue_cents", kind: Kind::Int64, optional: false, body: parquet::plain(&c2) },
-            Column { name: "assisted_sessions", kind: Kind::Int64, optional: false, body: parquet::plain(&c3) },
-        ],
-    )
-    .unwrap();
-    let rows: usize = results.iter().map(|r| r.1).sum();
-    let (cs, cr) = (c0.iter().sum::<i64>(), c2.iter().sum::<i64>());
-    lap(&format!("write: {rows} user rows, {} campaign rows; sessions {cs}, revenue {cr}", days.len()));
+    lap(&format!("write: {rows} user rows, {nrows} campaign rows; sessions {cs}, revenue {cr}"));
     // Nothing is dropped; the big mappings are released on all threads so exit does not tear them down on one.
+    // process::exit (libc exit), not _exit: the PGO-instrumented build writes its profile from an atexit handler.
     parallel(threads, |t| {
         evk[t].release();
         evp[t].release();
         cks[t].release();
         ev2[t].release();
+        if t == 0 {
+            links.release();
+        }
     });
     std::process::exit(0);
+}
+
+/// The process's user seconds, system seconds and minor faults so far.
+fn rusage() -> (f64, f64, i64) {
+    #[repr(C)]
+    struct Rusage {
+        utime: [i64; 2],
+        stime: [i64; 2],
+        rest: [i64; 14], // maxrss, ixrss, idrss, isrss, minflt, ...
+    }
+    unsafe extern "C" {
+        fn getrusage(who: i32, r: *mut Rusage) -> i32;
+    }
+    let mut r = Rusage { utime: [0; 2], stime: [0; 2], rest: [0; 14] };
+    unsafe { getrusage(0, &mut r) };
+    (r.utime[0] as f64 + r.utime[1] as f64 * 1e-6, r.stime[0] as f64 + r.stime[1] as f64 * 1e-6, r.rest[4])
 }
 
 /// The number in an ID of the shape `prefix` + 1..=7 ASCII digits without a leading zero.
@@ -333,6 +351,19 @@ fn numbered(id: &[u8], prefix: &[u8]) -> Option<usize> {
     Some(n)
 }
 
+/// `numbered(id, b"c_")` for a field in the reader's buffer: the digits go through the SWAR parser.
+///
+/// # Safety
+/// 8 bytes from `id[2]` must be readable.
+#[inline(always)]
+unsafe fn campaign_number(id: &[u8]) -> Option<usize> {
+    let n = id.len().wrapping_sub(2);
+    if n.wrapping_sub(1) >= 7 || id[0] != b'c' || id[1] != b'_' || (id[2] == b'0' && n > 1) {
+        return None;
+    }
+    unsafe { ts::digits8_at(id.as_ptr().add(2), n) }.map(|v| v as usize)
+}
+
 /// `n` threads running `f(thread index)`; their results in order.
 pub fn parallel<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
     std::thread::scope(|s| {
@@ -340,6 +371,90 @@ pub fn parallel<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
         let handles: Vec<_> = (0..n).map(|t| s.spawn(move || f(t))).collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     })
+}
+
+/// The link lines of one thread as key pairs.
+struct LinkLines(Vec<(Key, Key)>);
+
+impl Handler<2> for LinkLines {
+    #[inline(always)]
+    fn line<'a>(&mut self, mut f: impl Fields<'a>) {
+        let (a, b) = (f.next(), f.next());
+        if !a.is_empty() && !b.is_empty() {
+            let (ka, kb) = (key::pack(a), key::pack(b));
+            if ka != kb {
+                self.0.push((ka, kb));
+            }
+        }
+    }
+}
+
+/// One thread's parse state. Records wait in a ring while the link-table line of their user ID is prefetched;
+/// the lookup happens PIPE lines later, by which time the line has arrived.
+struct Parser<'a> {
+    ctx: &'a Ctx,
+    cat_of: &'a U64Map,
+    camp_of: &'a U64Map,
+    camp_num: &'a [u32],
+    links: &'a links::Links,
+    tc: TsCache,
+    evs: (Pool<EvKey, EV_STAGE>, Pool<Ev2, EV_STAGE>),
+    cks: Pool<Ck, CK_STAGE>,
+    epipe: Pipe<Ev>,
+    cpipe: Pipe<Ck>,
+}
+
+impl Parser<'_> {
+    /// The key and payload streams of the event's partition, pushed as a pair.
+    #[inline(always)]
+    fn emit_ev(&mut self, e: Ev) {
+        let p = key::part(e.key.eid, self.ctx.bits);
+        // The payload is built in registers: a wide load of a record patched in memory would wait for the patch.
+        let pay = Ev2 { person: self.links.lookup(e.pay.person), ts: e.pay.ts, pay: e.pay.pay };
+        self.evs.0.push2(&mut self.evs.1, p, e.key, pay);
+    }
+
+    #[inline(always)]
+    fn emit_ck(&mut self, c: Ck) {
+        let person = self.links.lookup(c.person);
+        self.cks.push(key::part(person, self.ctx.bits), Ck { person, cid: c.cid, ts: c.ts, camp: c.camp });
+    }
+
+    fn finish(mut self) -> (Pool<EvKey, EV_STAGE>, Pool<Ev2, EV_STAGE>, Pool<Ck, CK_STAGE>) {
+        for e in self.epipe.drain().collect::<Vec<_>>() {
+            self.emit_ev(e);
+        }
+        for c in self.cpipe.drain().collect::<Vec<_>>() {
+            self.emit_ck(c);
+        }
+        self.evs.0.finish2(&mut self.evs.1);
+        self.cks.finish();
+        (self.evs.0, self.evs.1, self.cks)
+    }
+}
+
+impl Handler<7> for Parser<'_> {
+    #[inline(always)]
+    fn line<'a>(&mut self, f: impl Fields<'a>) {
+        if let Some(e) = parse_event(f, self.ctx, self.cat_of, &mut self.tc) {
+            self.links.prefetch(e.pay.person);
+            if let Some(old) = self.epipe.push(e) {
+                self.emit_ev(old);
+            }
+        }
+    }
+}
+
+impl Handler<4> for Parser<'_> {
+    #[inline(always)]
+    fn line<'a>(&mut self, f: impl Fields<'a>) {
+        if let Some(c) = parse_click(f, self.ctx, self.camp_of, self.camp_num, &mut self.tc) {
+            self.links.prefetch(c.person);
+            if let Some(old) = self.cpipe.push(c) {
+                self.emit_ck(old);
+            }
+        }
+    }
 }
 
 /// A fixed-size delay line: `push` returns the record pushed PIPE calls earlier.
@@ -361,19 +476,7 @@ impl<T: Copy> Default for Pipe<T> {
 impl<T: Copy> Pipe<T> {
     #[inline(always)]
     fn push(&mut self, v: T) -> Option<T> {
-        let (slot, old) = self.slot();
-        *slot = v;
-        self.advance(old)
-    }
-    /// The slot the next record is built in, and what it held.
-    #[inline(always)]
-    fn slot(&mut self) -> (&mut T, T) {
-        let old = self.ring[self.at];
-        (&mut self.ring[self.at], old)
-    }
-    /// After the slot was filled: the record pushed PIPE calls earlier, once the ring is full.
-    #[inline(always)]
-    fn advance(&mut self, old: T) -> Option<T> {
+        let old = std::mem::replace(&mut self.ring[self.at], v);
         self.at = (self.at + 1) % PIPE;
         if self.filled < PIPE {
             self.filled += 1;
@@ -389,82 +492,64 @@ impl<T: Copy> Pipe<T> {
     }
 }
 
-/// Fills `e` from a line; false if the line yields no copy. Its `person` is still the user ID: the caller
-/// resolves it through the link table.
+/// The copy a line yields, if any. Its `person` is still the user ID: the caller resolves it through the link
+/// table.
 #[inline(always)]
-fn parse_event(l: &Line, ctx: &Ctx, cat_of: &U64Map, tc: &mut TsCache, e: &mut Ev) -> bool {
-    let id = l.get(0);
+fn parse_event<'a>(mut f: impl Fields<'a>, ctx: &Ctx, cat_of: &U64Map, tc: &mut TsCache) -> Option<Ev> {
+    let id = f.next();
     if id.is_empty() {
-        return false;
+        return None;
     }
-    let (user, ts, ingest, kind) = (l.get(1), l.get(2), l.get(3), l.get(4));
-    // Fields point into the reader's buffer, which keeps 64 readable bytes past the data.
+    // Every field is reduced to a word as soon as it is popped, so little stays live (in registers) across
+    // the timestamp parses. Fields point into the reader's buffer, which keeps readable bytes past the data.
+    let eid = unsafe { key::pack16(id.as_ptr(), id.len()) };
+    let user = f.next();
+    let user_ok = !user.is_empty();
+    let ukey = unsafe { key::pack16(user.as_ptr(), user.len()) };
+    let ts = f.next();
     let t = unsafe { tc.parse_raw(ts.as_ptr(), ts.len()) }.filter(|&t| t >= ctx.ws && t < ctx.we);
     // ponytail: rules.md guarantees ingest_ts is valid F1; a bad one sorts last and fails the late check.
+    let ingest = f.next();
     let ing = unsafe { tc.parse_raw(ingest.as_ptr(), ingest.len()) }.unwrap_or(i64::MAX);
+    let kind = f.next();
     let purchase = kind.len() == 8 && u64::from_le_bytes(kind.try_into().unwrap()) == u64::from_le_bytes(*b"purchase");
     let kind_ok = purchase
         || (kind.len() == 4 && {
             let k = u32::from_le_bytes(kind.try_into().unwrap());
             (k == u32::from_le_bytes(*b"view")) | (k == u32::from_le_bytes(*b"cart"))
         });
-    let product = l.get(5);
-    let mut valid = !user.is_empty() && !product.is_empty() && kind_ok && t.is_some_and(|t| ing - t <= DAY);
+    let (product, price) = (f.next(), f.next());
+    let mut valid = user_ok && !product.is_empty() && kind_ok && t.is_some_and(|t| ing - t <= DAY);
     let mut pay = 0;
     if valid && purchase {
-        match parse::price(l.get(6)) {
+        match parse::price(price) {
             Some(v) => pay = v | cat_of.get(unsafe { key::pack16(product.as_ptr(), product.len()) }).unwrap_or(ctx.unknown) << 24,
             None => valid = false,
         }
     }
-    e.key.eid = unsafe { key::pack16(id.as_ptr(), id.len()) };
-    e.key.ingest = ing;
-    e.pay.person = if valid { unsafe { key::pack16(user.as_ptr(), user.len()) } } else { 0 };
-    e.pay.ts = t.map_or(0, |t| (t - ctx.cws) as u32);
-    e.pay.pay = pay;
-    true
-}
-
-/// An event copy, its user ID resolved to its person, into its event partition's key and payload streams.
-#[inline(always)]
-fn emit_ev(e: Ev, links: &links::Links, bits: u32, (keys, pays): &mut (Pool<EvKey, EV_STAGE>, Pool<Ev2, EV_STAGE>)) {
-    let p = (mix(e.key.eid) >> (64 - bits)) as usize;
-    // The payload is built in registers: a wide load of a record patched in memory would wait for the patch.
-    keys.push2(pays, p, e.key, Ev2 { person: links.lookup(e.pay.person), ts: e.pay.ts, pay: e.pay.pay });
-}
-
-/// The person partition of a key: the top bits of one multiply (the people phase hashes keys with `mix`, whose
-/// bits below the top `bits` are independent of these).
-#[inline(always)]
-fn person_part(k: Key, bits: u32) -> usize {
-    (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - bits)) as usize
-}
-
-/// A click, its user ID resolved to its person, into its person partition.
-#[inline(always)]
-fn emit_ck(c: Ck, links: &links::Links, bits: u32, cks: &mut Pool<Ck, CK_STAGE>) {
-    let person = links.lookup(c.person);
-    cks.push(person_part(person, bits), Ck { person, cid: c.cid, ts: c.ts, camp: c.camp });
+    Some(Ev {
+        key: EvKey { eid, ingest: ing },
+        pay: Ev2 { person: if valid { ukey } else { 0 }, ts: t.map_or(0, |t| (t - ctx.cws) as u32), pay },
+    })
 }
 
 /// The click's `person` is still its user ID: the caller resolves it through the link table.
-#[inline]
-fn parse_click(l: &Line, ctx: &Ctx, camp_of: &U64Map, camp_num: &[u32], tc: &mut TsCache) -> Option<Ck> {
-    let (id, user, camp, ts) = (l.get(0), l.get(1), l.get(2), l.get(3));
+#[inline(always)]
+fn parse_click<'a>(mut f: impl Fields<'a>, ctx: &Ctx, camp_of: &U64Map, camp_num: &[u32], tc: &mut TsCache) -> Option<Ck> {
+    let (id, user) = (f.next(), f.next());
     if id.is_empty() || user.is_empty() {
         return None;
     }
-    let t = unsafe { tc.parse_raw(ts.as_ptr(), ts.len()) }.filter(|&t| t >= ctx.cws && t < ctx.we)?;
-    let camp = match numbered(camp, b"c_").and_then(|n| camp_num.get(n)).copied() {
+    let cid = unsafe { key::pack16(id.as_ptr(), id.len()) };
+    let ukey = unsafe { key::pack16(user.as_ptr(), user.len()) };
+    let camp = f.next();
+    let camp = match unsafe { campaign_number(camp) }.and_then(|n| camp_num.get(n)).copied() {
         Some(i) if i != 0 => i - 1,
         _ => camp_of.get(unsafe { key::pack16(camp.as_ptr(), camp.len()) })?,
     };
-    Some(Ck {
-        person: unsafe { key::pack16(user.as_ptr(), user.len()) },
-        cid: unsafe { key::pack16(id.as_ptr(), id.len()) },
-        ts: (t - ctx.cws) as u32,
-        camp,
-    })
+    let ts = f.next();
+    let t = unsafe { tc.parse_raw(ts.as_ptr(), ts.len()) }.filter(|&t| t >= ctx.cws && t < ctx.we)?;
+    Some(Ck { person: ukey, cid, ts: (t - ctx.cws) as u32, camp })
 }
 
 /// A line of the dedup table: a count, then 15 slots of `tag << 20 | position`, filled in order.
@@ -494,15 +579,16 @@ fn dedup(keys: &[&[EvKey]], pays: &[&[Ev2]], table: &mut Vec<TLine>, dropped: &m
     } else {
         // Lines of 15 slots at a load of 33-67%: a line is rarely full, and then the next one is probed.
         let lines = (n / 10).next_power_of_two().max(2);
-        // The partition took the top `bits` of the hash; the line takes the next ones, the tag 12 more.
-        let lsh = 64 - bits - lines.trailing_zeros();
-        let tsh = lsh.saturating_sub(12);
+        // The line is the top bits of a second multiply (the partition is the top bits of key::part's), the
+        // tag the 12 below them.
+        let lsh = 64 - lines.trailing_zeros();
+        let tsh = lsh - 12;
         table.clear();
         table.resize(lines, TLine([0; 16]));
         for (b, blk) in keys.iter().enumerate() {
             for (j, r) in blk.iter().enumerate() {
                 let pos = (b << 10 | j) as u32;
-                let h = mix(r.eid);
+                let h = r.eid.wrapping_mul(0xBF58_476D_1CE4_E5B9);
                 let tag = (h >> tsh) as u32 & 0xfff | 1;
                 let mut li = (h >> lsh) as usize & (lines - 1);
                 // In bounds: li is masked, positions come from this walk, and the table is never full.
@@ -548,7 +634,7 @@ fn dedup(keys: &[&[EvKey]], pays: &[&[Ev2]], table: &mut Vec<TLine>, dropped: &m
                 let keep = (e.person != 0) & (word & 1 == 0);
                 word >>= 1;
                 if keep {
-                    out.push(person_part(e.person, bits), *e);
+                    out.push(key::part(e.person, bits), *e);
                 }
             }
         }
@@ -602,4 +688,35 @@ fn manifest_ts(m: &[u8], key: &str) -> i64 {
 fn lines(f: &[u8]) -> impl Iterator<Item = &[u8]> {
     let body = f.iter().position(|&b| b == b'\n').map_or(&[][..], |i| &f[i + 1..]);
     body.strip_suffix(b"\n").unwrap_or(body).split(|&b| b == b'\n').filter(move |_| !body.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn campaign_number_matches_numbered() {
+        let mut rng = 0x5151_a2a2_b3b3_c4c4u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut buf = vec![b','; 32];
+        for _ in 0..100_000 {
+            let n = (next() % 11) as usize;
+            for (i, b) in buf[..n].iter_mut().enumerate() {
+                *b = match (i, next() % 12) {
+                    (0, 0..=9) => b'c',
+                    (1, 0..=9) => b'_',
+                    (_, 0..=7) => b'0' + (next() % 10) as u8,
+                    (_, 8) => b'0',
+                    _ => b"Cc_ \r\xd9x/"[(next() % 8) as usize],
+                };
+            }
+            let id = &buf[..n];
+            assert_eq!(unsafe { campaign_number(id) }, numbered(id, b"c_"), "{:?}", String::from_utf8_lossy(id));
+        }
+    }
 }

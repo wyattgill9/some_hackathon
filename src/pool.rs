@@ -5,9 +5,10 @@
 //! read-for-ownership, and the staging of all the partitions is `S` bytes each. Nothing is ever freed.
 use std::mem::size_of;
 
+use crate::mem::{self, HUGE, map_huge};
+
 pub const BLOCK: usize = 16 << 10;
 const REGION: usize = 32 << 20;
-const HUGE: usize = 2 << 20;
 const LINE: usize = 64;
 
 #[derive(Clone, Copy)]
@@ -121,6 +122,10 @@ impl<T: Copy, const S: usize> Pool<T, S> {
             }
             self.region_used = 0;
         }
+        // A fresh arena is faulted in 2 MiB at a time (no-op with huge pages); recycled blocks were written.
+        if self.region_len == REGION && self.region_used % HUGE == 0 {
+            mem::populate(unsafe { self.region.add(self.region_used) }, HUGE);
+        }
         let start = unsafe { self.region.add(self.region_used) } as *mut T;
         self.at[p] = [start, unsafe { start.add(self.cap) }];
         self.region_used += BLOCK;
@@ -167,7 +172,7 @@ impl<T: Copy, const S: usize> Pool<T, S> {
     /// Gives the pool's own arenas back now, in the calling thread, instead of at exit on one core.
     pub fn release(&self) {
         for &r in &self.regions {
-            unsafe { madvise(r, REGION, 4) }; // MADV_DONTNEED
+            mem::release(r, REGION);
         }
     }
 
@@ -246,30 +251,6 @@ unsafe fn nt64(dst: *mut u8, lo: std::arch::x86_64::__m256i, hi: std::arch::x86_
             _mm256_stream_si256(dst as *mut __m256i, lo);
             _mm256_stream_si256(dst.add(32) as *mut __m256i, hi);
         }
-    }
-}
-
-unsafe extern "C" {
-    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
-    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
-}
-
-/// `len` bytes of fresh, 2 MiB-aligned memory advised for transparent huge pages.
-pub fn map_huge(len: usize) -> *mut u8 {
-    const PROT_READ: i32 = 1;
-    const PROT_WRITE: i32 = 2;
-    const MAP_PRIVATE: i32 = 2;
-    const MAP_ANONYMOUS: i32 = 0x20;
-    const MAP_NORESERVE: i32 = 0x4000;
-    const MADV_HUGEPAGE: i32 = 14;
-    unsafe {
-        let p = mmap(std::ptr::null_mut(), len + HUGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-        assert!(p as isize != -1, "mmap failed");
-        let aligned = p.add(p.align_offset(HUGE));
-        if std::env::var_os("SS_NOHUGE").is_none() {
-            madvise(aligned, len, MADV_HUGEPAGE); // advisory: ignored where THP is off (SS_NOHUGE emulates that)
-        }
-        aligned
     }
 }
 
