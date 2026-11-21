@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::key::{self, Key};
 use crate::mem;
-use crate::parquet::{self, Column, Enc, Kind};
+use crate::parquet::{self, Buf, Column, Enc, Kind};
 use crate::{Ck, Ctx, DAY, Ev2, GAP, WEEK};
 
 const NONE: u32 = u32::MAX;
@@ -35,18 +35,47 @@ struct Credit {
 }
 
 /// user_daily rows as columns: strings as lengths and bytes, `present` as packed bits.
-#[derive(Default)]
 pub struct Rows {
     pub n: usize,
-    idlen: Vec<i32>,
-    idbytes: Vec<u8>,
-    day: Vec<i32>,
-    sessions: Vec<i32>,
-    events: Vec<i32>,
-    revenue: Vec<i64>,
-    present: Vec<u8>,
-    toplen: Vec<i32>,
-    topbytes: Vec<u8>,
+    idlen: Buf<i32>,
+    idbytes: Buf<u8>,
+    day: Buf<i32>,
+    sessions: Buf<i32>,
+    events: Buf<i32>,
+    revenue: Buf<i64>,
+    present: Buf<u8>,
+    toplen: Buf<i32>,
+    topbytes: Buf<u8>,
+}
+
+impl Rows {
+    /// Columns reserved for about `rows` rows (virtual; they grow past it).
+    fn new(rows: usize) -> Self {
+        Rows {
+            n: 0,
+            idlen: Buf::new(rows),
+            idbytes: Buf::new(rows * 10),
+            day: Buf::new(rows),
+            sessions: Buf::new(rows),
+            events: Buf::new(rows),
+            revenue: Buf::new(rows),
+            present: Buf::new(rows / 8 + 1),
+            toplen: Buf::new(rows),
+            topbytes: Buf::new(rows * 10),
+        }
+    }
+    /// Room for `n` more rows whose strings are at most 16 bytes (longer ones reserve as they go).
+    fn reserve(&mut self, n: usize) {
+        self.idlen.reserve(n);
+        self.idbytes.reserve(n * 16);
+        self.day.reserve(n);
+        self.sessions.reserve(n);
+        self.events.reserve(n);
+        self.revenue.reserve(n);
+        self.present.reserve(n / 8 + 1);
+        self.toplen.reserve(n);
+        self.topbytes.reserve(n * 16);
+    }
 }
 
 /// A session: start in ms from `cws`, day index, purchase revenue.
@@ -61,7 +90,6 @@ struct Out {
     sessions: Vec<Sess>,
     /// `day_first[d]` = index of the person's first session on day `d` or later; `ndays + 1` entries.
     day_first: Vec<u32>,
-    purchases: Vec<u32>,
     cat_rev: Vec<u64>,
     touched: Vec<u32>,
     /// Per campaign, `person << 32 | sessions already counted as assisted` (stale when the person differs).
@@ -98,20 +126,29 @@ pub struct Worker<'a> {
     boffs: Vec<u32>,
     cursor: Vec<u32>,
     lis: Vec<u32>,
+    /// Events by bin as `ts << 32 | local id`, then by person as `ts`; purchases apart as (local id, ts, pay),
+    /// then by person as (ts, pay).
     tmp: Vec<u64>,
-    tmp_li: Vec<u32>,
     offs: Vec<u32>,
-    sorted: Vec<u64>,
+    sorted: Vec<u32>,
+    purch: Vec<[u32; 3]>,
+    pcounts: Vec<u32>,
+    poffs: Vec<u32>,
+    psorted: Vec<[u32; 2]>,
     ccounts: Vec<u32>,
     coffs: Vec<u32>,
     ctmp: Vec<[u64; 2]>,
     ctmp_li: Vec<u32>,
     csorted: Vec<[u64; 2]>,
     out: Out,
+    /// The encoded user_daily columns (see `UserFile::write`), mapped and prefaulted up front so the encoding
+    /// at the end never waits for fresh pages.
+    enc: [Buf<u8>; 7],
 }
 
 impl<'a> Worker<'a> {
-    pub fn new(ctx: &'a Ctx) -> Self {
+    /// `rows` is the worker's expected share of user_daily rows (an upper estimate; only virtual space).
+    pub fn new(ctx: &'a Ctx, rows: usize) -> Self {
         Worker {
             ctx,
             nbins: ((ctx.we - ctx.cws) >> BIN) as usize + 2,
@@ -124,18 +161,29 @@ impl<'a> Worker<'a> {
             cursor: Vec::new(),
             lis: Vec::new(),
             tmp: Vec::new(),
-            tmp_li: Vec::new(),
             offs: Vec::new(),
             sorted: Vec::new(),
+            purch: Vec::new(),
+            pcounts: Vec::new(),
+            poffs: Vec::new(),
+            psorted: Vec::new(),
             ccounts: Vec::new(),
             coffs: Vec::new(),
             ctmp: Vec::new(),
             ctmp_li: Vec::new(),
             csorted: Vec::new(),
+            enc: {
+                let bound = parquet::delta_bound(rows);
+                let mut enc = [Buf::new(bound), Buf::new(bound), Buf::new(bound), Buf::new(bound), Buf::new(bound), Buf::new(rows / 8 + 64), Buf::new(bound)];
+                let r = rows / 2; // about 1.5x the rows expected, at the bytes a row usually encodes to
+                for (b, bytes) in enc.iter_mut().zip([r, r, r, r, 3 * r, rows / 8 + 64, r]) {
+                    b.prefault(bytes);
+                }
+                enc
+            },
             out: Out {
                 sessions: Vec::new(),
                 day_first: Vec::new(),
-                purchases: Vec::new(),
                 cat_rev: mem::zeroed(ctx.cats.len()),
                 touched: Vec::new(),
                 covered: mem::zeroed(ctx.ncamp),
@@ -143,7 +191,7 @@ impl<'a> Worker<'a> {
                 buf: Vec::new(),
                 id: [0; 16],
                 cat16: ctx.cats.iter().map(|c| { let mut a = [0; 16]; for (d, &s) in a.iter_mut().zip(c) { *d = s; } a }).collect(),
-                rows: Rows::default(),
+                rows: Rows::new(rows),
                 // Written pages, not calloc: these are read-modify-written, and a calloc page read first
                 // maps the zero page, whose copy-on-write flushes every thread's TLB.
                 cells: mem::zeroed::<Credit>((ctx.ncamp + 1) * ctx.ndays),
@@ -161,6 +209,7 @@ impl<'a> Worker<'a> {
             return;
         }
         let cblocks: Vec<&[Ck]> = cks.collect();
+        self.out.rows.reserve(n); // at most one row per event
         // Events are never sorted: a counting sort by bin, then a stable one by person, leaves each person's
         // events in bin order, which is all the session walk needs. The bin scatter also builds the local
         // index (person key -> dense local id; clicks only look up) and tags each record with its id. A table
@@ -173,7 +222,7 @@ impl<'a> Worker<'a> {
         }
         prefix(&self.bcounts, &mut self.boffs);
         let est = if self.ev_seen == 0 { n / 4 } else { n * self.np_seen / self.ev_seen + n / 32 };
-        let mut cap = (est * 2 + 2).next_power_of_two().max(1024);
+        let mut cap = (est + est / 2 + 2).next_power_of_two().max(1024);
         let np = loop {
             if self.table.len() != cap {
                 self.table.clear();
@@ -199,12 +248,28 @@ impl<'a> Worker<'a> {
         self.sorted.reserve(n);
         unsafe {
             let (srt, cur) = (self.sorted.as_mut_ptr(), self.cursor.as_mut_ptr());
-            for (&rec, &li) in self.tmp.iter().zip(&self.tmp_li) {
-                let c = cur.add(li as usize);
-                *srt.add(*c as usize) = rec;
+            for &rec in &self.tmp {
+                let c = cur.add(rec as u32 as usize);
+                *srt.add(*c as usize) = (rec >> 32) as u32;
                 *c += 1;
             }
             self.sorted.set_len(n);
+        }
+        // Purchases by person, each person's in ts order.
+        self.pcounts.clear();
+        self.pcounts.resize(np, 0);
+        for p in &self.purch {
+            self.pcounts[p[0] as usize] += 1;
+        }
+        prefix(&self.pcounts, &mut self.poffs);
+        self.cursor.clear();
+        self.cursor.extend_from_slice(&self.poffs[..np]);
+        self.psorted.clear();
+        self.psorted.resize(self.purch.len(), [0; 2]);
+        for p in &self.purch {
+            let c = &mut self.cursor[p[0] as usize];
+            self.psorted[*c as usize] = [p[1], p[2]];
+            *c += 1;
         }
         // Clicks of people with no events are dropped: they can credit nothing. The rest are counting-sorted
         // by bin then person like the events; ties within a bin are ordered per person.
@@ -278,16 +343,20 @@ impl<'a> Worker<'a> {
         }
         for li in 0..np {
             let evs = &self.sorted[self.offs[li] as usize..self.offs[li + 1] as usize];
+            let purch = &mut self.psorted[self.poffs[li] as usize..self.poffs[li + 1] as usize];
+            if purch.len() > 1 {
+                purch.sort_unstable_by_key(|p| p[0]);
+            }
             let cks = &mut self.csorted[self.coffs[li] as usize..self.coffs[li + 1] as usize];
             order_bins(cks);
-            person(self.ctx, &mut self.out, self.table[self.persons[li] as usize].key, evs, cks);
+            person(self.ctx, &mut self.out, self.table[self.persons[li] as usize].key, evs, purch, cks);
         }
         for &s in &self.persons {
             self.table[s as usize] = Slot::default();
         }
     }
 
-    /// Scatters the events by bin into `tmp` (`ts << 32 | pay`) and `tmp_li` (local id), building the index:
+    /// Scatters the events by bin into `tmp` (`ts << 32 | local id`), the purchases also into `purch`, building the index:
     /// the number of persons, or None (and a cleared table) when the table got half full.
     fn index(&mut self, eblocks: &[&[Ev2]], n: usize) -> Option<usize> {
         let cap = self.table.len();
@@ -298,13 +367,14 @@ impl<'a> Worker<'a> {
         self.cursor.extend_from_slice(&self.boffs[..self.nbins]);
         self.tmp.clear();
         self.tmp.reserve(n);
-        self.tmp_li.clear();
-        self.tmp_li.reserve(n);
+        self.purch.clear();
+        self.purch.reserve(n);
         let mut np = 0usize;
         // Every event writes one of the n reserved slots (bins from the window, counted above), every new
         // person (at most cap / 2) one `persons` slot; probes wrap within the table.
         let full = unsafe {
-            let (t, tmp, tli, cur, ps) = (self.table.as_mut_ptr(), self.tmp.as_mut_ptr(), self.tmp_li.as_mut_ptr(), self.cursor.as_mut_ptr(), self.persons.as_mut_ptr());
+            let (t, tmp, cur, ps, pu) = (self.table.as_mut_ptr(), self.tmp.as_mut_ptr(), self.cursor.as_mut_ptr(), self.persons.as_mut_ptr(), self.purch.as_mut_ptr());
+            let mut npu = 0;
             let mut full = false;
             'all: for e in eblocks.iter().flat_map(|b| b.iter()) {
                 let mut i = (e.person.wrapping_mul(HASH) >> shift) as usize;
@@ -315,7 +385,7 @@ impl<'a> Worker<'a> {
                         break s.li;
                     }
                     if s.key == 0 {
-                        if np * 2 == cap {
+                        if np * 10 >= cap * 7 {
                             full = true;
                             break 'all;
                         }
@@ -329,14 +399,17 @@ impl<'a> Worker<'a> {
                 let c = cur.add((e.ts >> BIN) as usize);
                 let p = *c as usize;
                 *c += 1;
-                *tmp.add(p) = (e.ts as u64) << 32 | e.pay as u64;
-                *tli.add(p) = li;
+                *tmp.add(p) = (e.ts as u64) << 32 | li as u64;
+                if e.pay != 0 {
+                    *pu.add(npu) = [li, e.ts, e.pay];
+                    npu += 1;
+                }
             }
             if !full {
                 self.tmp.set_len(n);
-                self.tmp_li.set_len(n);
             }
             self.persons.set_len(np);
+            self.purch.set_len(npu);
             full
         };
         if full {
@@ -353,8 +426,18 @@ impl<'a> Worker<'a> {
         let assisted = self.out.assisted.iter().copied().chain(std::iter::repeat(0));
         let cells = self.out.cells.iter().zip(assisted).map(|(c, a)| Cell { sessions: c.sessions, purchasing: c.purchasing, assisted: a, revenue: c.revenue }).collect();
         let r = self.out.rows;
-        let d = parquet::delta::<i32>;
-        let enc = [d(&r.idlen), d(&r.day), d(&r.sessions), d(&r.events), parquet::delta(&r.revenue), parquet::def_levels(&r.present, r.n), d(&r.toplen)];
+        let mut enc = self.enc;
+        let [idl, day, sess, ev, rev, defb, topl] = &mut enc;
+        parquet::delta(r.idlen.as_slice(), idl);
+        parquet::delta(r.day.as_slice(), day);
+        parquet::delta(r.sessions.as_slice(), sess);
+        parquet::delta(r.events.as_slice(), ev);
+        parquet::delta(r.revenue.as_slice(), rev);
+        parquet::delta(r.toplen.as_slice(), topl);
+        let def = parquet::def_levels(r.present.as_slice(), r.n);
+        defb.clear();
+        defb.reserve(def.len());
+        defb.extend(&def);
         (cells, r.n, UserFile { rows: r, enc })
     }
 }
@@ -362,19 +445,19 @@ impl<'a> Worker<'a> {
 /// A worker's user_daily table, encoded: the delta bodies of the integer and length columns, the string bytes.
 pub struct UserFile {
     rows: Rows,
-    enc: [Vec<u8>; 7],
+    enc: [Buf<u8>; 7],
 }
 
 impl UserFile {
     pub fn write(&self, path: &Path) {
         let (r, [idl, day, sess, ev, rev, def, topl]) = (&self.rows, &self.enc);
         let cols = [
-            Column { name: "user_id", kind: Kind::Str, enc: Enc::Delta, optional: false, parts: &[idl, &r.idbytes] },
-            Column { name: "day", kind: Kind::Date, enc: Enc::Delta, optional: false, parts: &[day] },
-            Column { name: "sessions", kind: Kind::Int32, enc: Enc::Delta, optional: false, parts: &[sess] },
-            Column { name: "events", kind: Kind::Int32, enc: Enc::Delta, optional: false, parts: &[ev] },
-            Column { name: "revenue_cents", kind: Kind::Int64, enc: Enc::Delta, optional: false, parts: &[rev] },
-            Column { name: "top_category", kind: Kind::Str, enc: Enc::Delta, optional: true, parts: &[def, topl, &r.topbytes] },
+            Column { name: "user_id", kind: Kind::Str, enc: Enc::Delta, optional: false, parts: &[idl.as_slice(), r.idbytes.as_slice()] },
+            Column { name: "day", kind: Kind::Date, enc: Enc::Delta, optional: false, parts: &[day.as_slice()] },
+            Column { name: "sessions", kind: Kind::Int32, enc: Enc::Delta, optional: false, parts: &[sess.as_slice()] },
+            Column { name: "events", kind: Kind::Int32, enc: Enc::Delta, optional: false, parts: &[ev.as_slice()] },
+            Column { name: "revenue_cents", kind: Kind::Int64, enc: Enc::Delta, optional: false, parts: &[rev.as_slice()] },
+            Column { name: "top_category", kind: Kind::Str, enc: Enc::Delta, optional: true, parts: &[def.as_slice(), topl.as_slice(), r.topbytes.as_slice()] },
         ];
         parquet::write(path, r.n, &cols).unwrap();
     }
@@ -408,11 +491,11 @@ fn order_bins(cks: &mut [[u64; 2]]) {
     }
 }
 
-/// One person: events `ts << 32 | pay` grouped by bin in bin order (unordered within a bin), and clicks
+/// One person: event timestamps grouped by bin in bin order (unordered within a bin), purchases `(ts, pay)` in ts order, and clicks
 /// `[ts << 32 | campaign, click_id]` sorted as above. Events in one bin are under 30 minutes apart, so they
 /// share a session; a session boundary falls between two consecutive non-empty bins iff the gap from the
 /// earlier bin's last event to the later bin's first is over 30 minutes.
-fn person(ctx: &Ctx, o: &mut Out, pk: Key, evs: &[u64], cks: &[[u64; 2]]) {
+fn person(ctx: &Ctx, o: &mut Out, pk: Key, evs: &[u32], purch: &[[u32; 2]], cks: &[[u64; 2]]) {
     o.sessions.clear();
     o.person += 1;
     o.buf.clear();
@@ -424,21 +507,22 @@ fn person(ctx: &Ctx, o: &mut Out, pk: Key, evs: &[u64], cks: &[[u64; 2]]) {
     let (mut day, mut sessions, mut events, mut rev) = (i32::MIN, 0u32, 0u32, 0i64);
     let mut prev_hi = 0u32;
 
-    let mut i = 0;
+    let (mut i, mut pi) = (0, 0);
     while i < evs.len() {
-        let bin = (evs[i] >> (32 + BIN)) as u32;
+        let bin = evs[i] >> BIN;
         let (mut lo, mut hi, mut count, mut brev) = (u32::MAX, 0u32, 0u32, 0i64);
-        o.purchases.clear();
-        while i < evs.len() && (evs[i] >> (32 + BIN)) as u32 == bin {
-            let (t, pay) = ((evs[i] >> 32) as u32, evs[i] as u32);
+        while i < evs.len() && evs[i] >> BIN == bin {
+            let t = evs[i];
             lo = lo.min(t);
             hi = hi.max(t);
             count += 1;
-            if pay != 0 {
-                brev += (pay & 0xff_ffff) as i64;
-                o.purchases.push(pay); // applied once the session, so the day, is known
-            }
             i += 1;
+        }
+        // The bin's purchases, applied once the session, so the day, is known.
+        let p0 = pi;
+        while pi < purch.len() && purch[pi][0] >> BIN == bin {
+            brev += (purch[pi][1] & 0xff_ffff) as i64;
+            pi += 1;
         }
         if o.sessions.is_empty() || lo - prev_hi > GAP as u32 {
             let d = (ctx.cws + lo as i64).div_euclid(DAY) as i32;
@@ -453,7 +537,7 @@ fn person(ctx: &Ctx, o: &mut Out, pk: Key, evs: &[u64], cks: &[[u64; 2]]) {
         events += count;
         rev += brev;
         o.sessions.last_mut().unwrap().rev += brev as u64;
-        for &pay in &o.purchases {
+        for &[_, pay] in &purch[p0..pi] {
             let (price, cat) = ((pay & 0xff_ffff) as u64, (pay >> 24) as usize);
             if o.cat_rev[cat] == 0 {
                 o.touched.push(cat as u32);
@@ -487,7 +571,8 @@ fn flush(ctx: &Ctx, o: &mut Out, day: i32, sessions: u32, events: u32, rev: i64)
     if o.buf.len() <= 16 {
         put16(&mut r.idbytes, o.id, o.buf.len());
     } else {
-        r.idbytes.extend_from_slice(&o.buf);
+        r.idbytes.reserve(o.buf.len());
+        r.idbytes.extend(&o.buf);
     }
     r.day.push(day);
     r.sessions.push(sessions as i32);
@@ -496,27 +581,24 @@ fn flush(ctx: &Ctx, o: &mut Out, day: i32, sessions: u32, events: u32, rev: i64)
     if r.n % 8 == 0 {
         r.present.push(0);
     }
-    *r.present.last_mut().unwrap() |= ((top != NONE) as u8) << (r.n % 8);
+    *r.present.last_mut() |= ((top != NONE) as u8) << (r.n % 8);
     if top != NONE {
         let c = &ctx.cats[top as usize];
         r.toplen.push(c.len() as i32);
         if c.len() <= 16 {
             put16(&mut r.topbytes, o.cat16[top as usize], c.len());
         } else {
-            r.topbytes.extend_from_slice(c);
+            r.topbytes.reserve(c.len());
+            r.topbytes.extend(c);
         }
     }
     r.n += 1;
 }
 
-/// Appends `len <= 16` bytes from a padded copy with one store.
+/// Appends `len <= 16` bytes from a padded copy with one store (room for 16 was reserved).
 #[inline(always)]
-fn put16(out: &mut Vec<u8>, v: [u8; 16], len: usize) {
-    out.reserve(16);
-    unsafe {
-        out.as_mut_ptr().add(out.len()).cast::<[u8; 16]>().write_unaligned(v);
-        out.set_len(out.len() + len);
-    }
+fn put16(out: &mut Buf<u8>, v: [u8; 16], len: usize) {
+    out.put16(v, len);
 }
 
 /// Credit each session to the latest click in [start - 7d, start] (ties: smallest click_id, which sorts last),
