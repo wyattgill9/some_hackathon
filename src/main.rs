@@ -433,11 +433,18 @@ fn emit_ev(e: Ev, links: &links::Links, bits: u32, (keys, pays): &mut (Pool<EvKe
     keys.push2(pays, p, e.key, Ev2 { person: links.lookup(e.pay.person), ts: e.pay.ts, pay: e.pay.pay });
 }
 
+/// The person partition of a key: the top bits of one multiply (the people phase hashes keys with `mix`, whose
+/// bits below the top `bits` are independent of these).
+#[inline(always)]
+fn person_part(k: Key, bits: u32) -> usize {
+    (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - bits)) as usize
+}
+
 /// A click, its user ID resolved to its person, into its person partition.
 #[inline(always)]
 fn emit_ck(c: Ck, links: &links::Links, bits: u32, cks: &mut Pool<Ck, CK_STAGE>) {
     let person = links.lookup(c.person);
-    cks.push((mix(person) >> (64 - bits)) as usize, Ck { person, cid: c.cid, ts: c.ts, camp: c.camp });
+    cks.push(person_part(person, bits), Ck { person, cid: c.cid, ts: c.ts, camp: c.camp });
 }
 
 /// The click's `person` is still its user ID: the caller resolves it through the link table.
@@ -541,7 +548,7 @@ fn dedup(keys: &[&[EvKey]], pays: &[&[Ev2]], table: &mut Vec<TLine>, dropped: &m
                 let keep = e.person != 0 && word & 1 == 0;
                 word >>= 1;
                 if keep {
-                    out.push((mix(e.person) >> (64 - bits)) as usize, *e);
+                    out.push(person_part(e.person, bits), *e);
                 }
             }
         }
