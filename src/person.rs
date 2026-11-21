@@ -65,6 +65,7 @@ impl Window {
 /// The per-person state and the outputs.
 struct Out {
     sessions: Vec<Sess>,
+    purchases: Vec<u32>,
     cat_rev: Vec<u64>,
     touched: Vec<u32>,
     win: Window,
@@ -75,6 +76,11 @@ struct Out {
 
 pub struct Worker<'a> {
     ctx: &'a Ctx,
+    nbins: usize,
+    bcounts: Vec<u32>,
+    boffs: Vec<u32>,
+    tmp: Vec<u64>,
+    tmp_li: Vec<u32>,
     keys: Vec<u64>,
     vals: Vec<u32>,
     lis: Vec<u32>,
@@ -93,6 +99,11 @@ impl<'a> Worker<'a> {
     pub fn new(ctx: &'a Ctx) -> Self {
         Worker {
             ctx,
+            nbins: ((ctx.we - ctx.cws) / GAP) as usize + 2,
+            bcounts: Vec::new(),
+            boffs: Vec::new(),
+            tmp: Vec::new(),
+            tmp_li: Vec::new(),
             keys: Vec::new(),
             vals: Vec::new(),
             lis: Vec::new(),
@@ -106,6 +117,7 @@ impl<'a> Worker<'a> {
             csorted: Vec::new(),
             out: Out {
                 sessions: Vec::new(),
+                purchases: Vec::new(),
                 cat_rev: vec![0; ctx.cats.len()],
                 touched: Vec::new(),
                 win: Window { count: vec![0; ctx.ncamp], pos: vec![0; ctx.ncamp], active: Vec::new() },
@@ -135,6 +147,11 @@ impl<'a> Worker<'a> {
         self.persons.clear();
         self.counts.clear();
         self.lis.clear();
+        // Events are never sorted: a counting sort by 30-minute bin, then a stable one by person, leaves each
+        // person's events in bin order, which is all the session walk needs.
+        let gap = GAP as u32;
+        self.bcounts.clear();
+        self.bcounts.resize(self.nbins, 0);
         for e in eblocks.iter().flat_map(|b| b.iter()) {
             let mut i = ((mix(e.person) << bits) >> shift) as usize;
             while self.keys[i] != 0 && self.keys[i] != e.person {
@@ -149,16 +166,30 @@ impl<'a> Worker<'a> {
             let li = self.vals[i];
             self.counts[li as usize] += 1;
             self.lis.push(li);
+            self.bcounts[(e.ts / gap) as usize] += 1;
         }
         let np = self.persons.len();
+        prefix(&self.bcounts, &mut self.boffs);
+        self.cursor.clear();
+        self.cursor.extend_from_slice(&self.boffs[..self.nbins]);
+        self.tmp.clear();
+        self.tmp.resize(n, 0);
+        self.tmp_li.clear();
+        self.tmp_li.resize(n, 0);
+        for (e, &li) in eblocks.iter().flat_map(|b| b.iter()).zip(&self.lis) {
+            let c = &mut self.cursor[(e.ts / gap) as usize];
+            self.tmp[*c as usize] = (e.ts as u64) << 32 | e.pay as u64;
+            self.tmp_li[*c as usize] = li;
+            *c += 1;
+        }
         prefix(&self.counts, &mut self.offs);
         self.cursor.clear();
         self.cursor.extend_from_slice(&self.offs[..np]);
         self.sorted.clear();
         self.sorted.resize(n, 0);
-        for (e, &li) in eblocks.iter().flat_map(|b| b.iter()).zip(&self.lis) {
+        for (&rec, &li) in self.tmp.iter().zip(&self.tmp_li) {
             let c = &mut self.cursor[li as usize];
-            self.sorted[*c as usize] = (e.ts as u64) << 32 | e.pay as u64;
+            self.sorted[*c as usize] = rec;
             *c += 1;
         }
         // Clicks of people with no events are dropped: they can credit nothing.
@@ -189,8 +220,7 @@ impl<'a> Worker<'a> {
             }
         }
         for li in 0..np {
-            let evs = &mut self.sorted[self.offs[li] as usize..self.offs[li + 1] as usize];
-            evs.sort_unstable();
+            let evs = &self.sorted[self.offs[li] as usize..self.offs[li + 1] as usize];
             // ts ascending, then click_id descending: the last click at or before a start is the credit.
             let cks = &mut self.csorted[self.coffs[li] as usize..self.coffs[li + 1] as usize];
             cks.sort_unstable_by(|a, b| (a[0] >> 32).cmp(&(b[0] >> 32)).then_with(|| key::cmp(b[1], a[1])));
@@ -225,34 +255,53 @@ fn prefix(counts: &[u32], offs: &mut Vec<u32>) {
     }
 }
 
-/// One person: ts-sorted events `ts << 32 | pay`, clicks `[ts << 32 | campaign, click_id]` sorted as above.
+/// One person: events `ts << 32 | pay` grouped by 30-minute bin in bin order (unordered within a bin), and
+/// clicks `[ts << 32 | campaign, click_id]` sorted as above. Events in one bin are less than 30 minutes
+/// apart, so they share a session; a session boundary can only fall between bins: always between bins
+/// that are not adjacent, and between adjacent ones iff the gap from the earlier bin's last event to the
+/// later bin's first is over 30 minutes.
 fn person(ctx: &Ctx, o: &mut Out, pk: Key, evs: &[u64], cks: &[[u64; 2]]) {
     o.sessions.clear();
     let (mut day, mut sessions, mut events, mut rev) = (i32::MIN, 0u32, 0u32, 0i64);
-    let mut last = i64::MIN;
-    for &e in evs {
-        let t = ctx.cws + (e >> 32) as i64;
-        if o.sessions.is_empty() || t - last > GAP {
-            let d = t.div_euclid(DAY) as i32;
+    let (mut prev_bin, mut prev_hi) = (u32::MAX, 0u32);
+    let gap = GAP as u32;
+    let mut i = 0;
+    while i < evs.len() {
+        let bin = (evs[i] >> 32) as u32 / gap;
+        let (mut lo, mut hi, mut count, mut brev) = (u32::MAX, 0u32, 0u32, 0i64);
+        o.purchases.clear();
+        while i < evs.len() && (evs[i] >> 32) as u32 / gap == bin {
+            let (t, pay) = ((evs[i] >> 32) as u32, evs[i] as u32);
+            lo = lo.min(t);
+            hi = hi.max(t);
+            count += 1;
+            if pay != 0 {
+                brev += (pay & 0xff_ffff) as i64;
+                o.purchases.push(pay); // applied once the session, so the day, is known
+            }
+            i += 1;
+        }
+        if o.sessions.is_empty() || bin != prev_bin + 1 || lo - prev_hi > gap {
+            let start = ctx.cws + lo as i64;
+            let d = start.div_euclid(DAY) as i32;
             if d != day {
                 flush(ctx, o, pk, day, sessions, events, rev);
                 (day, sessions, events, rev) = (d, 0, 0, 0);
             }
             sessions += 1;
-            o.sessions.push(Sess { start: t, rev: 0 });
+            o.sessions.push(Sess { start, rev: 0 });
         }
-        last = t;
-        events += 1;
-        let pay = e as u32;
-        if pay != 0 {
+        events += count;
+        rev += brev;
+        o.sessions.last_mut().unwrap().rev += brev as u64;
+        for &pay in &o.purchases {
             let (price, cat) = ((pay & 0xff_ffff) as u64, (pay >> 24) as usize);
-            rev += price as i64;
             if o.cat_rev[cat] == 0 {
                 o.touched.push(cat as u32);
             }
             o.cat_rev[cat] += price;
-            o.sessions.last_mut().unwrap().rev += price;
         }
+        (prev_bin, prev_hi) = (bin, hi);
     }
     flush(ctx, o, pk, day, sessions, events, rev);
     attribute(ctx, o, cks);
