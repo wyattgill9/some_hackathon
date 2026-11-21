@@ -116,6 +116,15 @@ impl Links {
                     prefetch(parent[sb as usize].as_ptr() as *const u8);
                     slots[j] = (sa, sb);
                 }
+                // The second hop of each find and the key of the root it usually is, prefetched too: the
+                // first hop has arrived by now, and a root's line is as random as any.
+                for &(sa, sb) in &slots[..batch.len()] {
+                    for x in [sa, sb] {
+                        let p = parent[x as usize].load(Relaxed) as usize;
+                        prefetch(parent[p].as_ptr() as *const u8);
+                        prefetch(table[p / 4].as_ptr() as *const u8);
+                    }
+                }
                 for &(sa, sb) in &slots[..batch.len()] {
                     loop {
                         let (ra, rb) = (find(sa), find(sb));
@@ -134,13 +143,31 @@ impl Links {
         // Names: each thread fills the lines of its chunk (the keys and parents it reads are final now).
         let lchunk = lines.div_ceil(threads).max(1);
         parallel(threads, |t| {
-            for line in t * lchunk..((t + 1) * lchunk).min(lines) {
-                for j in 0..4 {
-                    let s = (line * 4 + j) as u32;
-                    if key_at(s) != 0 {
-                        table[line][4 + j].store(key_at(find(s)), Relaxed);
+            let (from, to) = (t * lchunk, ((t + 1) * lchunk).min(lines));
+            let mut start = from;
+            while start < to {
+                let end = (start + 16).min(to);
+                // The lines and their parents are read in order (the hardware prefetches them); the parent
+                // of the parent and the root's key line are random, so they are asked for a block ahead.
+                for line in start..end {
+                    for j in 0..4 {
+                        let s = line * 4 + j;
+                        if table[line][j].load(Relaxed) != 0 {
+                            let p = parent[s].load(Relaxed) as usize;
+                            prefetch(parent[p].as_ptr() as *const u8);
+                            prefetch(table[p / 4].as_ptr() as *const u8);
+                        }
                     }
                 }
+                for line in start..end {
+                    for j in 0..4 {
+                        let s = (line * 4 + j) as u32;
+                        if key_at(s) != 0 {
+                            table[line][4 + j].store(key_at(find(s)), Relaxed);
+                        }
+                    }
+                }
+                start = end;
             }
         });
         // Every thread's writes are complete (joined); the atomics are read as plain words from here on.
