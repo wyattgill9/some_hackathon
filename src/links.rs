@@ -1,12 +1,13 @@
 //! Linked IDs: union-find over packed keys, each person named by its byte-wise smallest ID. The union always
 //! hangs the root with the larger key under the root with the smaller one, so every chain strictly decreases
-//! and the root of a tree is the person's name. The result is a read-only map from linked ID to name.
-use crate::key::{self, Key};
+//! and the root of a tree is the person's name. The result is a read-only open-addressing table from linked ID
+//! to name, 16 bytes per slot so a lookup costs one cache line, which callers can prefetch ahead of time.
+use crate::key::{self, Key, mix};
 use crate::u64map::U64Map;
 
 pub struct Links {
-    slot_of: U64Map,
-    names: Vec<Key>,
+    table: Vec<[Key; 2]>, // (id, name); id 0 = empty
+    mask: usize,
 }
 
 impl Links {
@@ -14,12 +15,12 @@ impl Links {
     pub fn build(edges: &[Vec<(Key, Key)>]) -> Links {
         let n: usize = edges.iter().map(|e| e.len()).sum();
         let mut slot_of = U64Map::new(n * 2);
-        let mut names: Vec<Key> = Vec::with_capacity(n * 2);
+        let mut keys: Vec<Key> = Vec::with_capacity(n * 2);
         let mut parent: Vec<u32> = Vec::with_capacity(n * 2);
         for &(a, b) in edges.iter().flatten() {
             let [a, b] = [a, b].map(|k| {
                 slot_of.get_or_insert_with(k, || {
-                    names.push(k);
+                    keys.push(k);
                     parent.push(parent.len() as u32);
                     parent.len() as u32 - 1
                 })
@@ -28,22 +29,49 @@ impl Links {
             if ra == rb {
                 continue;
             }
-            let (lo, hi) = if key::cmp(names[ra as usize], names[rb as usize]).is_lt() { (ra, rb) } else { (rb, ra) };
+            let (lo, hi) = if key::cmp(keys[ra as usize], keys[rb as usize]).is_lt() { (ra, rb) } else { (rb, ra) };
             parent[hi as usize] = lo;
         }
-        for i in 0..parent.len() {
-            let r = find(&mut parent, i as u32);
-            names[i] = names[r as usize];
+        let cap = (keys.len() * 2).next_power_of_two().max(16);
+        let mut table = vec![[0; 2]; cap];
+        let mask = cap - 1;
+        for i in 0..keys.len() {
+            let name = keys[find(&mut parent, i as u32) as usize];
+            let mut s = (mix(keys[i]) >> 32) as usize & mask;
+            while table[s][0] != 0 {
+                s = (s + 1) & mask;
+            }
+            table[s] = [keys[i], name];
         }
-        Links { slot_of, names }
+        Links { table, mask }
+    }
+
+    #[inline]
+    pub fn prefetch(&self, k: Key) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            let s = (mix(k) >> 32) as usize & self.mask;
+            _mm_prefetch::<_MM_HINT_T0>(self.table.as_ptr().add(s) as *const i8);
+        }
     }
 
     /// The person's name: the root of a linked ID, or the ID itself.
     #[inline]
     pub fn lookup(&self, k: Key) -> Key {
-        match self.slot_of.get(k) {
-            Some(s) => self.names[s as usize],
-            None => k,
+        if k == 0 {
+            return 0;
+        }
+        let mut s = (mix(k) >> 32) as usize & self.mask;
+        loop {
+            let [id, name] = self.table[s];
+            if id == k {
+                return name;
+            }
+            if id == 0 {
+                return k;
+            }
+            s = (s + 1) & self.mask;
         }
     }
 }

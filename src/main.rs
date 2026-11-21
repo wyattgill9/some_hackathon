@@ -8,6 +8,7 @@ mod parse;
 mod person;
 mod pool;
 mod reader;
+mod scan;
 mod ts;
 mod u64map;
 
@@ -138,13 +139,11 @@ fn main() {
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             let Some(r) = link_ranges.get(i) else { break out };
-            rd.lines(&link_files[r.file].0, r, |l| {
-                if let Some([a, b]) = parse::fields::<2>(l) {
-                    if !a.is_empty() && !b.is_empty() {
-                        let (ka, kb) = (key::pack(a), key::pack(b));
-                        if ka != kb {
-                            out.push((ka, kb));
-                        }
+            rd.fields::<2>(&link_files[r.file].0, r, |[a, b]| {
+                if !a.is_empty() && !b.is_empty() {
+                    let (ka, kb) = (key::pack(a), key::pack(b));
+                    if ka != kb {
+                        out.push((ka, kb));
                     }
                 }
             });
@@ -161,22 +160,45 @@ fn main() {
     let parsed: Vec<(Pool<Ev>, Pool<Ck>)> = parallel(threads, |_| {
         let (mut rd, mut tc) = (Reader::default(), TsCache::default());
         let (mut evs, mut cks) = (Pool::<Ev>::new(parts), Pool::<Ck>::new(parts));
+        // Records wait in a ring while the link-table line of their user ID is prefetched; the lookup happens
+        // PIPE lines later, by which time the line has arrived.
+        let (mut epipe, mut cpipe) = (Pipe::<Ev>::default(), Pipe::<Ck>::default());
+        let emit_ev = |mut e: Ev, evs: &mut Pool<Ev>| {
+            e.person = links.lookup(e.person);
+            evs.push((mix(e.eid) >> (64 - bits)) as usize, e);
+        };
+        let emit_ck = |mut c: Ck, cks: &mut Pool<Ck>| {
+            c.person = links.lookup(c.person);
+            cks.push((mix(c.person) >> (64 - bits)) as usize, c);
+        };
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             let Some((is_event, r)) = tasks.get(i) else { break };
             if *is_event {
-                rd.lines(&event_files[r.file].0, r, |l| {
-                    if let Some(e) = parse_event(l, &ctx, &cat_of, &links, &mut tc) {
-                        evs.push((mix(e.eid) >> (64 - bits)) as usize, e);
+                rd.fields::<7>(&event_files[r.file].0, r, |l| {
+                    if let Some(e) = parse_event(l, &ctx, &cat_of, &mut tc) {
+                        links.prefetch(e.person);
+                        if let Some(old) = epipe.push(e) {
+                            emit_ev(old, &mut evs);
+                        }
                     }
                 });
             } else {
-                rd.lines(&click_files[r.file].0, r, |l| {
-                    if let Some(c) = parse_click(l, &ctx, &camp_of, &links, &mut tc) {
-                        cks.push((mix(c.person) >> (64 - bits)) as usize, c);
+                rd.fields::<4>(&click_files[r.file].0, r, |l| {
+                    if let Some(c) = parse_click(l, &ctx, &camp_of, &mut tc) {
+                        links.prefetch(c.person);
+                        if let Some(old) = cpipe.push(c) {
+                            emit_ck(old, &mut cks);
+                        }
                     }
                 });
             }
+        }
+        for e in epipe.drain() {
+            emit_ev(e, &mut evs);
+        }
+        for c in cpipe.drain() {
+            emit_ck(c, &mut cks);
         }
         evs.finish();
         cks.finish();
@@ -278,9 +300,36 @@ fn parallel<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
     })
 }
 
+/// A fixed-size delay line.
+struct Pipe<T: Copy> {
+    ring: [Option<T>; PIPE],
+    at: usize,
+}
+
+const PIPE: usize = 16;
+
+impl<T: Copy> Default for Pipe<T> {
+    fn default() -> Self {
+        Pipe { ring: [None; PIPE], at: 0 }
+    }
+}
+
+impl<T: Copy> Pipe<T> {
+    #[inline]
+    fn push(&mut self, v: T) -> Option<T> {
+        let old = self.ring[self.at].replace(v);
+        self.at = (self.at + 1) % PIPE;
+        old
+    }
+    fn drain(&mut self) -> impl Iterator<Item = T> + '_ {
+        let at = self.at;
+        (0..PIPE).filter_map(move |i| self.ring[(at + i) % PIPE].take())
+    }
+}
+
+/// The event's `person` is still its user ID: the caller resolves it through the link table.
 #[inline]
-fn parse_event(l: &[u8], ctx: &Ctx, cat_of: &U64Map, links: &links::Links, tc: &mut TsCache) -> Option<Ev> {
-    let [id, user, ts, ingest, kind, product, price] = parse::fields::<7>(l)?;
+fn parse_event([id, user, ts, ingest, kind, product, price]: [&[u8]; 7], ctx: &Ctx, cat_of: &U64Map, tc: &mut TsCache) -> Option<Ev> {
     if id.is_empty() {
         return None;
     }
@@ -298,10 +347,9 @@ fn parse_event(l: &[u8], ctx: &Ctx, cat_of: &U64Map, links: &links::Links, tc: &
             None => valid = false,
         }
     }
-    let person = if valid { links.lookup(key::pack(user)) } else { 0 };
     Some(Ev {
         eid: key::pack(id),
-        person,
+        person: if valid { key::pack(user) } else { 0 },
         ingest: (ing.div_euclid(1000) - ctx.cws.div_euclid(1000) + (1 << 31)).clamp(0, u32::MAX as i64) as u32,
         ts: t.map_or(0, |t| (t - ctx.cws) as u32),
         pay,
@@ -309,15 +357,15 @@ fn parse_event(l: &[u8], ctx: &Ctx, cat_of: &U64Map, links: &links::Links, tc: &
     })
 }
 
+/// The click's `person` is still its user ID: the caller resolves it through the link table.
 #[inline]
-fn parse_click(l: &[u8], ctx: &Ctx, camp_of: &U64Map, links: &links::Links, tc: &mut TsCache) -> Option<Ck> {
-    let [id, user, camp, ts] = parse::fields::<4>(l)?;
+fn parse_click([id, user, camp, ts]: [&[u8]; 4], ctx: &Ctx, camp_of: &U64Map, tc: &mut TsCache) -> Option<Ck> {
     if id.is_empty() || user.is_empty() {
         return None;
     }
     let t = tc.parse(ts).filter(|t| (ctx.cws..ctx.we).contains(t))?;
     let camp = camp_of.get(key::pack(camp))?;
-    Some(Ck { person: links.lookup(key::pack(user)), cid: key::pack(id), ts: (t - ctx.cws) as u32, camp })
+    Some(Ck { person: key::pack(user), cid: key::pack(id), ts: (t - ctx.cws) as u32, camp })
 }
 
 /// One event partition: an open-addressing table on the bits below the partition bits keeps, per event_id,

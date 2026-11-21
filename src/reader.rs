@@ -1,11 +1,15 @@
 //! Files cut into byte ranges that threads take from a shared counter. A range owns the lines that start in it
 //! (a line starts at `p` iff `p == 0` or the byte before it is `\n`); the line starting at 0 is the header.
-//! Each range is read with `pread` into a reused per-thread buffer, plus a tail for its last line.
+//! Each range is read with `pread` into a reused per-thread buffer, indexed with `scan`, and walked line by
+//! line: a line with exactly N fields whose quotes are all whole-field wrappers yields its N unquoted fields.
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
+use crate::scan::Index;
+
 const TAIL: usize = 64 << 10;
+const PAD: usize = 64;
 
 pub struct Range {
     pub file: usize,
@@ -47,44 +51,81 @@ pub fn ranges(files: &[(File, u64)], target: u64) -> Vec<Range> {
 #[derive(Default)]
 pub struct Reader {
     buf: Vec<u8>,
+    index: Index,
 }
 
 impl Reader {
-    /// Calls `f` on every line the range owns, in order, without its `\n`. A missing final `\n` still ends a line.
-    pub fn lines(&mut self, file: &File, r: &Range, mut f: impl FnMut(&[u8])) {
+    /// Calls `f` with the fields of every well-formed N-field line the range owns, in order.
+    pub fn fields<const N: usize>(&mut self, file: &File, r: &Range, mut f: impl FnMut([&[u8]; N])) {
         let from = r.start.saturating_sub(1);
         let owned_end = (r.end - from) as usize; // buffer index of file offset r.end
         let mut want = owned_end + TAIL;
-        let (mut n, mut eof) = self.fill(file, from, want);
-        // The first owned line starts after the first newline at or after `from` (that skips the header at 0).
-        let mut pos = match self.buf[..n].iter().position(|&b| b == b'\n') {
-            Some(i) => i + 1,
-            None => return,
-        };
-        while pos < owned_end {
-            match self.buf[pos..n].iter().position(|&b| b == b'\n') {
-                Some(i) => {
-                    f(&self.buf[pos..pos + i]);
-                    pos += i + 1;
-                }
-                None if eof => {
-                    if pos < n {
-                        f(&self.buf[pos..n]);
-                    }
+        let n = loop {
+            let (mut n, eof) = self.fill(file, from, want);
+            if eof {
+                if n == 0 {
                     return;
                 }
-                None => {
-                    // The line runs past the tail: read more of the file, from the same place.
-                    want += TAIL;
-                    (n, eof) = self.fill(file, from, want);
+                if self.buf[n - 1] != b'\n' {
+                    self.buf[n] = b'\n'; // a missing final newline still ends the last line
+                    n += 1;
+                }
+                break n;
+            }
+            // Every owned line ends inside the buffer iff some newline sits at or after owned_end - 1.
+            if self.buf[owned_end - 1..n].contains(&b'\n') {
+                break n;
+            }
+            want += TAIL;
+        };
+        // The first owned line starts after the first newline at or after `from` (that skips the header at 0).
+        let Some(first) = self.buf[..n].iter().position(|&b| b == b'\n') else { return };
+        let pos = first + 1;
+        if pos >= owned_end {
+            return;
+        }
+        self.index.build(&self.buf, n);
+        let (buf, idx) = (&self.buf[..], &self.index);
+        let mut k = idx.nl.partition_point(|&x| (x as usize) < pos);
+        let mut d = idx.delims.partition_point(|&x| (x as usize) < pos) - 1; // the newline at pos - 1
+        let mut qi = idx.quotes.partition_point(|&x| (x as usize) < pos);
+        let mut start = pos;
+        while start < owned_end {
+            let end = idx.nl[k] as usize;
+            let mut quotes = 0;
+            while (idx.quotes[qi] as usize) < end {
+                quotes += 1;
+                qi += 1;
+            }
+            if idx.delims[d + N] as usize == end {
+                let mut out = [&buf[..0]; N];
+                let mut wrapped = 0;
+                for (i, o) in out.iter_mut().enumerate() {
+                    let fld = &buf[idx.delims[d + i] as usize + 1..idx.delims[d + i + 1] as usize];
+                    if fld.len() >= 2 && fld[0] == b'"' && fld[fld.len() - 1] == b'"' {
+                        wrapped += 1;
+                        *o = &fld[1..fld.len() - 1];
+                    } else {
+                        *o = fld;
+                    }
+                }
+                if quotes == 2 * wrapped {
+                    f(out);
+                }
+                d += N;
+            } else {
+                while idx.delims[d] as usize != end {
+                    d += 1;
                 }
             }
+            start = end + 1;
+            k += 1;
         }
     }
 
     fn fill(&mut self, file: &File, from: u64, want: usize) -> (usize, bool) {
-        if self.buf.len() < want {
-            self.buf.resize(want, 0);
+        if self.buf.len() < want + PAD {
+            self.buf.resize(want + PAD, 0);
         }
         let mut n = 0;
         while n < want {
@@ -102,20 +143,21 @@ impl Reader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parse;
     use std::io::Write;
 
-    fn owned_lines(file: &File, size: u64, target: u64) -> Vec<Vec<u8>> {
+    fn through_reader<const N: usize>(file: &File, size: u64, target: u64) -> Vec<Vec<Vec<u8>>> {
         let files = [(file.try_clone().unwrap(), size)];
         let mut out = Vec::new();
         let mut rd = Reader::default();
         for r in ranges(&files, target) {
-            rd.lines(&files[0].0, &r, |l| out.push(l.to_vec()));
+            rd.fields::<N>(&files[0].0, &r, |l| out.push(l.iter().map(|f| f.to_vec()).collect()));
         }
         out
     }
 
     #[test]
-    fn every_split_sees_every_line_once() {
+    fn every_split_matches_the_scalar_parser() {
         let mut rng = 0x1234_5678_9abc_def1u64;
         let mut next = || {
             rng ^= rng << 13;
@@ -126,9 +168,9 @@ mod tests {
         for trailing_newline in [true, false] {
             let mut data = b"header\n".to_vec();
             let mut lines = Vec::new();
-            for _ in 0..60 {
-                let n = (next() % 40) as usize;
-                let line: Vec<u8> = (0..n).map(|_| [b'a', b',', b'"', b'\r', 0, 0xc3][(next() % 6) as usize]).collect();
+            for _ in 0..300 {
+                let n = (next() % 24) as usize;
+                let line: Vec<u8> = (0..n).map(|_| b"a,,\"\"\"\r\0\xc3,"[(next() % 10) as usize]).collect();
                 data.extend_from_slice(&line);
                 data.push(b'\n');
                 lines.push(line);
@@ -136,20 +178,25 @@ mod tests {
             if !trailing_newline {
                 data.pop();
             }
-            let path = std::env::temp_dir().join(format!("reader-test-{}", std::process::id()));
+            let want: Vec<Vec<Vec<u8>>> = lines
+                .iter()
+                .filter_map(|l| parse::fields::<3>(l))
+                .map(|fs| fs.iter().map(|f| f.to_vec()).collect())
+                .collect();
+            assert!(want.len() > 20, "the generated lines should include well-formed ones");
+            let path = std::env::temp_dir().join(format!("reader-test-{}-{trailing_newline}", std::process::id()));
             File::create(&path).unwrap().write_all(&data).unwrap();
             let file = File::open(&path).unwrap();
             for target in [1u64, 2, 3, 7, 64, 1000, 1 << 20] {
-                assert_eq!(owned_lines(&file, data.len() as u64, target), lines, "target {target}");
+                assert_eq!(through_reader::<3>(&file, data.len() as u64, target), want, "target {target}");
             }
             std::fs::remove_file(&path).unwrap();
         }
-        // Header only, with and without a newline; empty file.
         for data in [&b"header\n"[..], b"header", b""] {
             let path = std::env::temp_dir().join(format!("reader-test-{}-h", std::process::id()));
             File::create(&path).unwrap().write_all(data).unwrap();
             let file = File::open(&path).unwrap();
-            assert!(owned_lines(&file, data.len() as u64, 3).is_empty());
+            assert!(through_reader::<2>(&file, data.len() as u64, 3).is_empty());
             std::fs::remove_file(&path).unwrap();
         }
     }
