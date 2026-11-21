@@ -137,7 +137,9 @@ fn main() {
     // Partitions of about 2 MiB of CSV each: every later phase works on one in cache.
     let bits = env("SS_PBITS").map_or(((event_bytes >> 21).next_power_of_two().trailing_zeros()).clamp(4, 11), |b| b as u32);
     let parts = 1usize << bits;
-    let range = env("SS_RANGE").unwrap_or(256 << 10);
+    // 128 KiB ranges: a thread's read buffer plus its open partition stages must share a 1 MiB L2 with its
+    // SMT sibling on the scorer (neutral on a private-L2 desktop).
+    let range = env("SS_RANGE").unwrap_or(128 << 10);
     let ctx = Ctx { ws, we, cws, cws_s: cws.div_euclid(1000), day0, ndays, bits, ncamp, cats: cats.iter().map(|c| c.to_vec()).collect(), unknown };
     fs::create_dir_all(out.join("user_daily")).unwrap();
     fs::create_dir_all(out.join("campaign_daily")).unwrap();
