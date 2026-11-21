@@ -168,7 +168,15 @@ fn probe_after(out: &std::path::Path) {
     for e in fs::read_dir(&dir).unwrap() {
         fs::remove_file(e.unwrap().path()).unwrap();
     }
-    parquet::write(&dir.join("part-0.parquet"), 0, &[Column { name: "user_id", kind: Kind::Str, optional: false, body: &[] }]).unwrap();
+    let cols = [
+        Column { name: "user_id", kind: Kind::Str, optional: false, body: &[] },
+        Column { name: "day", kind: Kind::Date, optional: false, body: &[] },
+        Column { name: "sessions", kind: Kind::Int32, optional: false, body: &[] },
+        Column { name: "events", kind: Kind::Int32, optional: false, body: &[] },
+        Column { name: "revenue_cents", kind: Kind::Int64, optional: false, body: &[] },
+        Column { name: "top_category", kind: Kind::Str, optional: true, body: &[] },
+    ];
+    parquet::write(&dir.join("part-0.parquet"), 0, &cols).unwrap();
     eprintln!("probe: user_daily emptied on purpose");
 }
 
