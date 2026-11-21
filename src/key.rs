@@ -38,7 +38,7 @@ pub unsafe fn pack16(p: *const u8, len: usize) -> Key {
     const HIGH: u64 = ONES << 7;
     unsafe {
         if len.wrapping_sub(1) >= 9 {
-            return pack(std::slice::from_raw_parts(p, len));
+            return pack_slow(p, len);
         }
         let n8 = (8 * len) as u32; // BZHI keeps everything past 64
         let w = _bzhi_u64((p as *const u64).read_unaligned(), n8);
@@ -51,10 +51,18 @@ pub unsafe fn pack16(p: *const u8, len: usize) -> Key {
         let nine = (len == 9) as u64;
         let b8 = (*p.add(8) as u64 & nine.wrapping_neg()) | (nine ^ 1);
         if ((zero | w) & HIGH) | ((b8.wrapping_sub(1) | b8) & 0x80) != 0 {
-            return pack(std::slice::from_raw_parts(p, len));
+            return pack_slow(p, len);
         }
         head | (b8 & nine.wrapping_neg())
     }
+}
+
+/// `pack` out of line: inlined, its scalar loops were auto-vectorized and their constants hoisted into
+/// the parse loop, where every fast-path merge point re-materialized them.
+#[cold]
+#[inline(never)]
+unsafe fn pack_slow(p: *const u8, len: usize) -> Key {
+    pack(unsafe { std::slice::from_raw_parts(p, len) })
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
