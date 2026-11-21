@@ -4,10 +4,24 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY .cargo ./.cargo
 COPY src ./src
-# Scorers are Intel Xeon Cascade Lake or newer: x86-64-v3 (AVX2, BMI2) is always there. Static: no loader at run time.
-ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+crt-static"
-RUN cargo build --release --locked --target x86_64-unknown-linux-gnu \
- && cp target/x86_64-unknown-linux-gnu/release/pipeline /pipeline
+COPY generator ./generator
+# Scorers are Intel Xeon Cascade Lake: tune for it, keep jumps off 32-byte boundaries (the JCC erratum
+# mitigation empties the uop cache otherwise), and link statically so nothing is loaded at run time.
+ENV BASE="-C target-cpu=cascadelake -C target-feature=+crt-static -C llvm-args=-x86-branches-within-32B-boundaries"
+ENV TARGET="x86_64-unknown-linux-gnu"
+# Profile-guided build: an instrumented binary runs on a 2M-event set from the track's own generator, and
+# the final binary is compiled with that profile. Any failure along the way falls back to a plain build.
+RUN (rustup component add llvm-tools \
+     && RUSTFLAGS="$BASE -Cprofile-generate=/tmp/pgo" cargo build --release --locked --target $TARGET --target-dir /tmp/instrumented \
+     && rustc --edition 2024 -O -C panic=abort generator/src/main.rs -o /tmp/generate \
+     && /tmp/generate --seed 11 --events 2000000 --clicks 500000 --output /tmp/train >/dev/null \
+     && mkdir -p /tmp/out \
+     && DATA_DIR=/tmp/train OUTPUT_DIR=/tmp/out NCPU=8 /tmp/instrumented/$TARGET/release/pipeline \
+     && "$(rustc --print sysroot)/lib/rustlib/$TARGET/bin/llvm-profdata" merge -o /tmp/pgo.profdata /tmp/pgo/*.profraw \
+     && RUSTFLAGS="$BASE -Cprofile-use=/tmp/pgo.profdata" cargo build --release --locked --target $TARGET \
+     && echo "PGO build") \
+ || (echo "PGO failed: plain build" && RUSTFLAGS="$BASE" cargo build --release --locked --target $TARGET)
+RUN cp target/$TARGET/release/pipeline /pipeline
 
 FROM scratch
 COPY --from=build /pipeline /pipeline
