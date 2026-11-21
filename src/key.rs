@@ -75,12 +75,13 @@ pub unsafe fn pack16(p: *const u8, len: usize) -> Key {
             _mm_or_si128(code(digit, b'0' - 1), code(upper, b'A' - 11)),
             _mm_or_si128(_mm_and_si128(under, _mm_set1_epi8(37)), code(lower, b'a' - 38)),
         );
-        // Lanes past the ID must be zero: pack from a copy with the tail cleared.
-        let mut bytes = [0u8; 16];
-        _mm_storeu_si128(bytes.as_mut_ptr() as *mut __m128i, codes);
-        bytes[len..].fill(0);
-        let head = _pext_u64(u64::from_be_bytes(bytes[..8].try_into().unwrap()), 0x3f3f_3f3f_3f3f_3f3f);
-        head << 16 | (bytes[8] as u64) << 10 | (bytes[9] as u64) << 4
+        // Lanes past the ID are zeroed; the first 8 codes pack with one pext, codes 9 and 10 by hand.
+        let keep = _mm_cmpgt_epi8(_mm_set1_epi8(len as i8), _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15));
+        let codes = _mm_and_si128(codes, keep);
+        let lo = _mm_cvtsi128_si64(codes) as u64;
+        let hi = _mm_extract_epi16::<4>(codes) as u32;
+        let head = _pext_u64(lo.swap_bytes(), 0x3f3f_3f3f_3f3f_3f3f);
+        head << 16 | ((hi & 0xff) as u64) << 10 | ((hi >> 8) as u64) << 4
     }
 }
 

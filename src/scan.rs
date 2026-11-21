@@ -37,10 +37,16 @@ impl Index {
 
 #[inline]
 fn flatten(mut m: u64, o: usize, out: &mut Vec<u32>) {
+    out.reserve(64);
+    let (base, p) = (out.len(), out.as_mut_ptr());
+    let mut n = 0;
     while m != 0 {
-        out.push((o + m.trailing_zeros() as usize) as u32);
+        // In bounds: at most 64 bits are set and 64 slots were reserved.
+        unsafe { p.add(base + n).write((o + m.trailing_zeros() as usize) as u32) };
+        n += 1;
         m &= m - 1;
     }
+    unsafe { out.set_len(base + n) };
 }
 
 /// Bit i set where block[i] is a delimiter (`,` or `\n`), a newline, a quote.

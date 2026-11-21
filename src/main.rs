@@ -300,30 +300,38 @@ pub fn parallel<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
     })
 }
 
-/// A fixed-size delay line.
+/// A fixed-size delay line: `push` returns the record pushed PIPE calls earlier.
 struct Pipe<T: Copy> {
-    ring: [Option<T>; PIPE],
+    ring: [T; PIPE],
     at: usize,
+    filled: usize,
 }
 
 const PIPE: usize = 16;
 
 impl<T: Copy> Default for Pipe<T> {
     fn default() -> Self {
-        Pipe { ring: [None; PIPE], at: 0 }
+        // The records are plain data; the zeroed slots are never read before being written.
+        Pipe { ring: [unsafe { std::mem::zeroed() }; PIPE], at: 0, filled: 0 }
     }
 }
 
 impl<T: Copy> Pipe<T> {
     #[inline]
     fn push(&mut self, v: T) -> Option<T> {
-        let old = self.ring[self.at].replace(v);
+        let old = std::mem::replace(&mut self.ring[self.at], v);
         self.at = (self.at + 1) % PIPE;
-        old
+        if self.filled < PIPE {
+            self.filled += 1;
+            None
+        } else {
+            Some(old)
+        }
     }
     fn drain(&mut self) -> impl Iterator<Item = T> + '_ {
-        let at = self.at;
-        (0..PIPE).filter_map(move |i| self.ring[(at + i) % PIPE].take())
+        let (at, filled) = (self.at, self.filled);
+        self.filled = 0;
+        (0..filled).map(move |i| self.ring[(at + PIPE - filled + i) % PIPE])
     }
 }
 

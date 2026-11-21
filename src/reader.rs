@@ -101,7 +101,11 @@ impl Reader {
                 let mut out = [&buf[..0]; N];
                 let mut wrapped = 0;
                 for (i, o) in out.iter_mut().enumerate() {
-                    let fld = &buf[idx.delims[d + i] as usize + 1..idx.delims[d + i + 1] as usize];
+                    // In bounds: the index ends in SENTINELS entries past any d + N, and positions are < n.
+                    let fld = unsafe {
+                        let (a, b) = (*idx.delims.get_unchecked(d + i) as usize + 1, *idx.delims.get_unchecked(d + i + 1) as usize);
+                        buf.get_unchecked(a..b)
+                    };
                     if fld.len() >= 2 && fld[0] == b'"' && fld[fld.len() - 1] == b'"' {
                         wrapped += 1;
                         *o = &fld[1..fld.len() - 1];
