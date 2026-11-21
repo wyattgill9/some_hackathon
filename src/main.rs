@@ -289,8 +289,8 @@ fn main() {
     });
     lap("people");
     lap(&format!("write: {rows} user rows, {nrows} campaign rows; sessions {cs}, revenue {cr}"));
-    // Nothing is dropped; the big mappings are released on all threads so exit does not tear them down on one,
-    // and _exit skips the libc teardown.
+    // Nothing is dropped; the big mappings are released on all threads so exit does not tear them down on one.
+    // process::exit (libc exit), not _exit: the PGO-instrumented build writes its profile from an atexit handler.
     parallel(threads, |t| {
         evs[t].release();
         cks[t].release();
@@ -299,10 +299,7 @@ fn main() {
             links.release();
         }
     });
-    unsafe extern "C" {
-        fn _exit(code: i32) -> !;
-    }
-    unsafe { _exit(0) }
+    std::process::exit(0);
 }
 
 /// The process's user seconds, system seconds and minor faults so far.
