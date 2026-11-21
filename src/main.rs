@@ -217,18 +217,15 @@ fn main() {
     // Dedup per event partition: keep the copy with the smallest ingest_ts, emit it if valid, by person.
     let next = AtomicUsize::new(0);
     let ev2: Vec<Pool<Ev2>> = parallel(threads, |_| {
-        let (mut recs, mut filter, mut suspects) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut filter, mut suspects) = (Vec::new(), Vec::new());
         let mut out = Pool::<Ev2>::new(parts);
         loop {
             let p = next.fetch_add(1, Ordering::Relaxed);
             if p >= parts {
                 break;
             }
-            recs.clear();
-            for t in &evs {
-                t.blocks(p).for_each(|b| recs.extend_from_slice(b));
-            }
-            dedup(&recs, &mut filter, &mut suspects, bits, &mut out);
+            let blocks: Vec<&[Ev]> = evs.iter().flat_map(|t| t.blocks(p)).collect();
+            dedup(&blocks, &mut filter, &mut suspects, bits, &mut out);
         }
         out.finish();
         out
@@ -412,19 +409,20 @@ fn parse_click(l: &Line, ctx: &Ctx, camp_of: &U64Map, tc: &mut TsCache) -> Optio
     })
 }
 
-/// One event partition. A two-bit counter per hash slot (16 slots per copy) tells which event_ids were
-/// seen more than once: the others, nearly all of them, are emitted straight from one sequential pass;
-/// the suspects are sorted by (event_id, ingest) so the earliest copy of each wins. Valid winners go to
-/// their person's partition. Copies with equal ingest are identical, so which one wins is immaterial.
-fn dedup(recs: &[Ev], filter: &mut Vec<u64>, suspects: &mut Vec<u32>, bits: u32, out: &mut Pool<Ev2>) {
-    if recs.is_empty() {
+/// One event partition, read in place from its blocks. A two-bit counter per hash slot (32 slots per copy)
+/// tells which event_ids were seen more than once: the others, nearly all of them, are emitted straight from
+/// the second pass; the suspects are sorted by event_id and the copy with the smallest ingest of each wins.
+/// Valid winners go to their person's partition. Copies with equal ingest are identical, so ties are immaterial.
+fn dedup(blocks: &[&[Ev]], filter: &mut Vec<u64>, suspects: &mut Vec<Ev>, bits: u32, out: &mut Pool<Ev2>) {
+    let n: usize = blocks.iter().map(|b| b.len()).sum();
+    if n == 0 {
         return;
     }
-    let slots = (recs.len() * 16).next_power_of_two().max(64);
+    let slots = (n * 32).next_power_of_two().max(64);
     let shift = 64 - slots.trailing_zeros();
     filter.clear();
     filter.resize(slots / 32, 0);
-    for r in recs {
+    for r in blocks.iter().flat_map(|b| b.iter()) {
         let h = ((mix(r.eid) << bits) >> shift) as usize;
         let (w, sh) = (&mut filter[h >> 5], (h & 31) * 2);
         let seen = (*w >> sh) & 1;
@@ -436,23 +434,26 @@ fn dedup(recs: &[Ev], filter: &mut Vec<u64>, suspects: &mut Vec<u32>, bits: u32,
         }
     };
     suspects.clear();
-    for (i, r) in recs.iter().enumerate() {
+    for r in blocks.iter().flat_map(|b| b.iter()) {
         let h = ((mix(r.eid) << bits) >> shift) as usize;
         if (filter[h >> 5] >> ((h & 31) * 2)) & 2 != 0 {
-            suspects.push(i as u32);
+            suspects.push(*r);
         } else {
             emit(*r, out);
         }
     }
-    suspects.sort_unstable_by_key(|&i| (recs[i as usize].eid, recs[i as usize].ingest));
+    suspects.sort_unstable_by_key(|r| r.eid);
     let mut k = 0;
     while k < suspects.len() {
-        let r = recs[suspects[k] as usize];
-        emit(r, out);
+        let mut best = suspects[k];
         k += 1;
-        while k < suspects.len() && recs[suspects[k] as usize].eid == r.eid {
+        while k < suspects.len() && suspects[k].eid == best.eid {
+            if suspects[k].ingest < best.ingest {
+                best = suspects[k];
+            }
             k += 1;
         }
+        emit(best, out);
     }
 }
 
