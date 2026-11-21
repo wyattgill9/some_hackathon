@@ -2,11 +2,17 @@
 //! person the sessions (gap > 30 min), the user_daily rows, the credited click and the assisting campaigns.
 use std::path::Path;
 
-use crate::key::{self, Key, mix};
+use crate::key::{self, Key};
 use crate::parquet::{self, Column, Kind};
 use crate::{Ck, Ctx, DAY, Ev2, GAP, WEEK};
 
 const NONE: u32 = u32::MAX;
+/// Events and clicks are binned by `ts >> BIN`: 2^20 ms, under the session gap, so one bin never spans two
+/// sessions and a session boundary is a gap over GAP between consecutive non-empty bins.
+const BIN: u32 = 20;
+const _: () = assert!((1u64 << BIN) <= GAP as u64 + 1);
+/// Multiplier of the local index hash (the partition took the top bits of `mix`).
+const HASH: u64 = 0xD6E8_FEB8_6659_FD93;
 /// Sessions x clicks up to which a person takes the all-pairs attribution path.
 const SMALL: usize = 256;
 
@@ -94,7 +100,7 @@ impl<'a> Worker<'a> {
     pub fn new(ctx: &'a Ctx) -> Self {
         Worker {
             ctx,
-            nbins: ((ctx.we - ctx.cws) / GAP) as usize + 2,
+            nbins: ((ctx.we - ctx.cws) >> BIN) as usize + 2,
             table: Vec::new(),
             persons: Vec::new(),
             ev_seen: 0,
@@ -137,7 +143,6 @@ impl<'a> Worker<'a> {
             return;
         }
         let cblocks: Vec<&[Ck]> = cks.collect();
-        let gap = GAP as u32;
         // Local index: person key -> dense local id, built from the events; clicks only look up. A table that
         // fills past half is abandoned and the partition indexed again in one four times larger.
         let est = if self.ev_seen == 0 { n / 4 } else { n * self.np_seen / self.ev_seen + n / 32 };
@@ -169,7 +174,7 @@ impl<'a> Worker<'a> {
             let (tmp, tli, cur, lis) = (self.tmp.as_mut_ptr(), self.tmp_li.as_mut_ptr(), self.cursor.as_mut_ptr(), self.lis.as_ptr());
             let mut k = 0;
             for e in eblocks.iter().flat_map(|b| b.iter()) {
-                let c = cur.add((e.ts / gap) as usize);
+                let c = cur.add((e.ts >> BIN) as usize);
                 let p = *c as usize;
                 *c += 1;
                 *tmp.add(p) = (e.ts as u64) << 32 | e.pay as u64;
@@ -208,12 +213,12 @@ impl<'a> Worker<'a> {
         self.bcounts.resize(self.nbins, 0);
         self.ccounts.clear();
         self.ccounts.resize(np, 0);
-        let (mask, shift, bits) = (self.table.len() - 1, 64 - self.table.len().trailing_zeros(), self.ctx.bits);
+        let (mask, shift) = (self.table.len() - 1, 64 - self.table.len().trailing_zeros());
         unsafe {
             let (t, lis, bc, cc) = (self.table.as_ptr(), self.lis.as_mut_ptr(), self.bcounts.as_mut_ptr(), self.ccounts.as_mut_ptr());
             let mut k = 0;
             for c in cblocks.iter().flat_map(|b| b.iter()) {
-                let mut i = ((mix(c.person) << bits) >> shift) as usize;
+                let mut i = (c.person.wrapping_mul(HASH) >> shift) as usize;
                 let li = loop {
                     let s = &*t.add(i);
                     if s.key == c.person {
@@ -227,7 +232,7 @@ impl<'a> Worker<'a> {
                 *lis.add(k) = li;
                 k += 1;
                 if li != NONE {
-                    *bc.add((c.ts / gap) as usize) += 1;
+                    *bc.add((c.ts >> BIN) as usize) += 1;
                     *cc.add(li as usize) += 1;
                 }
             }
@@ -245,7 +250,7 @@ impl<'a> Worker<'a> {
             let (ct, cl, cur) = (self.ctmp.as_mut_ptr(), self.ctmp_li.as_mut_ptr(), self.cursor.as_mut_ptr());
             for (c, &li) in cblocks.iter().flat_map(|b| b.iter()).zip(&self.lis) {
                 if li != NONE {
-                    let k = cur.add((c.ts / gap) as usize);
+                    let k = cur.add((c.ts >> BIN) as usize);
                     let p = *k as usize;
                     *k += 1;
                     *ct.add(p) = [(c.ts as u64) << 32 | c.camp as u64, c.cid];
@@ -284,20 +289,22 @@ impl<'a> Worker<'a> {
     /// None (and a cleared table) when the table got half full.
     fn index(&mut self, eblocks: &[&[Ev2]], n: usize) -> Option<usize> {
         let cap = self.table.len();
-        let (mask, shift, bits, gap) = (cap - 1, 64 - cap.trailing_zeros(), self.ctx.bits, GAP as u32);
+        let (mask, shift) = (cap - 1, 64 - cap.trailing_zeros());
         self.persons.clear();
+        self.persons.reserve(cap / 2);
         self.bcounts.clear();
         self.bcounts.resize(self.nbins, 0);
         self.lis.clear();
         self.lis.reserve(n);
         let mut np = 0usize;
-        // Every event writes one `lis` slot; bins come from the window, probes wrap within the table.
+        // Every event writes one `lis` slot, every new person (at most cap / 2) one `persons` slot; bins come
+        // from the window, probes wrap within the table.
         let full = unsafe {
-            let (t, lis, bc) = (self.table.as_mut_ptr(), self.lis.as_mut_ptr(), self.bcounts.as_mut_ptr());
+            let (t, lis, bc, ps) = (self.table.as_mut_ptr(), self.lis.as_mut_ptr(), self.bcounts.as_mut_ptr(), self.persons.as_mut_ptr());
             let mut k = 0;
             let mut full = false;
             'all: for e in eblocks.iter().flat_map(|b| b.iter()) {
-                let mut i = ((mix(e.person) << bits) >> shift) as usize;
+                let mut i = (e.person.wrapping_mul(HASH) >> shift) as usize;
                 let li = loop {
                     let s = &mut *t.add(i);
                     if s.key == e.person {
@@ -310,7 +317,7 @@ impl<'a> Worker<'a> {
                             break 'all;
                         }
                         *s = Slot { key: e.person, li: np as u32, count: 1 };
-                        self.persons.push(i as u32);
+                        *ps.add(np) = i as u32;
                         np += 1;
                         break np as u32 - 1;
                     }
@@ -318,9 +325,10 @@ impl<'a> Worker<'a> {
                 };
                 *lis.add(k) = li;
                 k += 1;
-                *bc.add((e.ts / gap) as usize) += 1;
+                *bc.add((e.ts >> BIN) as usize) += 1;
             }
             self.lis.set_len(k);
+            self.persons.set_len(np);
             full
         };
         if full {
@@ -365,12 +373,12 @@ fn prefix(counts: &[u32], offs: &mut Vec<u32>) {
 /// One person's clicks `[ts << 32 | campaign, click_id]`, in bin order: each run of one bin is sorted by ts
 /// ascending then click_id descending, so the last click at or before a session start is its credit.
 fn order_bins(cks: &mut [[u64; 2]]) {
-    let gap = GAP as u32;
+
     let mut i = 0;
     while i < cks.len() {
-        let bin = (cks[i][0] >> 32) as u32 / gap;
+        let bin = (cks[i][0] >> (32 + BIN)) as u32;
         let mut j = i + 1;
-        while j < cks.len() && (cks[j][0] >> 32) as u32 / gap == bin {
+        while j < cks.len() && (cks[j][0] >> (32 + BIN)) as u32 == bin {
             j += 1;
         }
         if j - i > 1 {
@@ -380,11 +388,10 @@ fn order_bins(cks: &mut [[u64; 2]]) {
     }
 }
 
-/// One person: events `ts << 32 | pay` grouped by 30-minute bin in bin order (unordered within a bin), and
-/// clicks `[ts << 32 | campaign, click_id]` sorted as above. Events in one bin are less than 30 minutes
-/// apart, so they share a session; a session boundary can only fall between bins: always between bins
-/// that are not adjacent, and between adjacent ones iff the gap from the earlier bin's last event to the
-/// later bin's first is over 30 minutes.
+/// One person: events `ts << 32 | pay` grouped by bin in bin order (unordered within a bin), and clicks
+/// `[ts << 32 | campaign, click_id]` sorted as above. Events in one bin are under 30 minutes apart, so they
+/// share a session; a session boundary falls between two consecutive non-empty bins iff the gap from the
+/// earlier bin's last event to the later bin's first is over 30 minutes.
 fn person(ctx: &Ctx, o: &mut Out, pk: Key, evs: &[u64], cks: &[[u64; 2]]) {
     o.sessions.clear();
     o.day_first.clear();
@@ -392,14 +399,14 @@ fn person(ctx: &Ctx, o: &mut Out, pk: Key, evs: &[u64], cks: &[[u64; 2]]) {
     o.buf.clear();
     key::decode(pk, &mut o.buf);
     let (mut day, mut sessions, mut events, mut rev) = (i32::MIN, 0u32, 0u32, 0i64);
-    let (mut prev_bin, mut prev_hi) = (u32::MAX, 0u32);
-    let gap = GAP as u32;
+    let mut prev_hi = 0u32;
+
     let mut i = 0;
     while i < evs.len() {
-        let bin = (evs[i] >> 32) as u32 / gap;
+        let bin = (evs[i] >> (32 + BIN)) as u32;
         let (mut lo, mut hi, mut count, mut brev) = (u32::MAX, 0u32, 0u32, 0i64);
         o.purchases.clear();
-        while i < evs.len() && (evs[i] >> 32) as u32 / gap == bin {
+        while i < evs.len() && (evs[i] >> (32 + BIN)) as u32 == bin {
             let (t, pay) = ((evs[i] >> 32) as u32, evs[i] as u32);
             lo = lo.min(t);
             hi = hi.max(t);
@@ -410,7 +417,7 @@ fn person(ctx: &Ctx, o: &mut Out, pk: Key, evs: &[u64], cks: &[[u64; 2]]) {
             }
             i += 1;
         }
-        if o.sessions.is_empty() || bin != prev_bin + 1 || lo - prev_hi > gap {
+        if o.sessions.is_empty() || lo - prev_hi > GAP as u32 {
             let d = (ctx.cws + lo as i64).div_euclid(DAY) as i32;
             if d != day {
                 flush(ctx, o, day, sessions, events, rev);
@@ -433,7 +440,7 @@ fn person(ctx: &Ctx, o: &mut Out, pk: Key, evs: &[u64], cks: &[[u64; 2]]) {
             }
             o.cat_rev[cat] += price;
         }
-        (prev_bin, prev_hi) = (bin, hi);
+        prev_hi = hi;
     }
     flush(ctx, o, day, sessions, events, rev);
     while o.day_first.len() <= ctx.ndays {
