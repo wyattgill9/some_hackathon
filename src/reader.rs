@@ -96,8 +96,9 @@ impl Reader {
         while start < owned_end {
             // A line of exactly N fields ends at the N-th delimiter after its start, which must be a newline
             // with no newline before it.
-            let cand = idx.delims[d + N] as usize;
-            if cand < n && data[cand] == b'\n' && idx.newlines_before(cand) == l0 {
+            // In bounds: d is at a real delimiter and SENTINELS entries follow the last one; cand < n is checked.
+            let cand = unsafe { *idx.delims.get_unchecked(d + N) } as usize;
+            if cand < n && unsafe { *data.get_unchecked(cand) } == b'\n' && idx.newlines_before(cand) == l0 {
                 let q1 = idx.quotes_before(cand);
                 // In bounds: the delimiter positions are < n, FRONT bytes precede the data and PAD follow it.
                 let (starts, lens, wrapped) = unsafe { split::<N>(dp, idx.delims.as_ptr().add(d)) };
@@ -116,7 +117,7 @@ impl Reader {
                 while data[idx.delims[d] as usize] != b'\n' {
                     d += 1;
                 }
-                let end = idx.delims[d] as usize;
+                let end = idx.delims[d] as usize; // rare path: checked indexing is fine
                 q0 = idx.quotes_before(end);
                 l0 = idx.newlines_before(end) + 1;
                 start = end + 1;
