@@ -1,7 +1,8 @@
-//! A minimal Parquet writer: one row group (none for 0 rows), one PLAIN uncompressed v1 data page per column,
-//! Thrift compact footer. Just enough for the two output tables; `scripts/check_parquet.py` reads the result
-//! back with polars, pyarrow and duckdb.
-use std::io::Write;
+//! A minimal Parquet writer: one row group (none for 0 rows), one uncompressed v1 data page per column,
+//! Thrift compact footer, the whole file written with one `writev`. Integers go DELTA_BINARY_PACKED or PLAIN,
+//! strings DELTA_LENGTH_BYTE_ARRAY or PLAIN. Just enough for the two output tables; `scripts/check_parquet.py`
+//! reads the result back with polars, pyarrow and duckdb.
+use std::io::{IoSlice, Write};
 use std::path::Path;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -12,12 +13,20 @@ pub enum Kind {
     Str,
 }
 
-/// `body` is the finished page body: the definition levels (if optional) followed by the PLAIN values.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Enc {
+    Plain,
+    /// DELTA_BINARY_PACKED (integers), DELTA_LENGTH_BYTE_ARRAY (strings).
+    Delta,
+}
+
+/// `parts` concatenated are the page body: the definition levels (if optional) followed by the values.
 pub struct Column<'a> {
     pub name: &'static str,
     pub kind: Kind,
+    pub enc: Enc,
     pub optional: bool,
-    pub body: &'a [u8],
+    pub parts: &'a [&'a [u8]],
 }
 
 /// A PLAIN BYTE_ARRAY value.
@@ -33,18 +42,88 @@ pub fn plain<T: Copy>(v: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
-/// Definition levels of an optional column: `[i32 byte length][one bit-packed run of width 1]`, in groups of 8.
-pub fn def_levels(present: &[bool]) -> Vec<u8> {
-    let groups = present.len().div_ceil(8);
+/// Definition levels of an optional column from `n` packed presence bits (bit i of byte i / 8), as
+/// `[i32 byte length][one bit-packed run of width 1]` in groups of 8.
+pub fn def_levels(bits: &[u8], n: usize) -> Vec<u8> {
+    let groups = n.div_ceil(8);
     let mut run = Vec::new();
     varint(&mut run, (groups as u64) << 1 | 1);
     let mut out = Vec::with_capacity(4 + run.len() + groups);
     out.extend_from_slice(&((run.len() + groups) as u32).to_le_bytes());
     out.extend_from_slice(&run);
-    for g in present.chunks(8) {
-        out.push(g.iter().enumerate().fold(0u8, |b, (j, &p)| b | (p as u8) << j));
+    out.extend_from_slice(&bits[..groups]);
+    out
+}
+/// DELTA_BINARY_PACKED: blocks of 128 deltas in 4 miniblocks of 32, each bit-packed at its own width.
+pub fn delta<T: Copy + Into<i64>>(vals: &[T]) -> Vec<u8> {
+    let n = vals.len();
+    let mut out = Vec::with_capacity(n * 2 + 16);
+    varint(&mut out, 128);
+    varint(&mut out, 4);
+    varint(&mut out, n as u64);
+    // The first value is written even for an empty column: readers may take it as part of the header.
+    let mut prev = vals.first().map_or(0, |&v| v.into());
+    zigzag(&mut out, prev);
+    let mut i = 1;
+    while i < n {
+        let chunk = &vals[i..n.min(i + 128)];
+        let mut blk = [0i64; 128];
+        let mut min = i64::MAX;
+        for (b, &v) in blk.iter_mut().zip(chunk) {
+            let v: i64 = v.into();
+            *b = v.wrapping_sub(prev);
+            prev = v;
+            min = min.min(*b);
+        }
+        zigzag(&mut out, min);
+        // Deltas less the minimum; the padding past the chunk stays 0 and never raises a width.
+        let mut u = [0u64; 128];
+        for (x, &d) in u.iter_mut().zip(&blk[..chunk.len()]) {
+            *x = d.wrapping_sub(min) as u64;
+        }
+        let used = chunk.len().div_ceil(32);
+        let mut widths = [0u8; 4];
+        for (m, w) in widths.iter_mut().enumerate().take(used) {
+            *w = (64 - u[m * 32..m * 32 + 32].iter().fold(0, |a, &x| a | x).leading_zeros()) as u8;
+        }
+        out.extend_from_slice(&widths);
+        for (m, &w) in widths.iter().enumerate().take(used) {
+            pack32(&mut out, &u[m * 32..m * 32 + 32], w as u32);
+        }
+        i += chunk.len();
     }
     out
+}
+
+/// 32 values bit-packed LSB first at width `w`: exactly `4 * w` bytes.
+fn pack32(out: &mut Vec<u8>, v: &[u64], w: u32) {
+    if w == 0 {
+        return;
+    }
+    out.reserve(4 * w as usize);
+    if w <= 32 {
+        let (mut acc, mut bits) = (0u64, 0);
+        for &x in v {
+            acc |= x << bits;
+            bits += w;
+            if bits >= 32 {
+                out.extend_from_slice(&(acc as u32).to_le_bytes());
+                acc >>= 32;
+                bits -= 32;
+            }
+        }
+    } else {
+        let (mut acc, mut bits) = (0u128, 0);
+        for &x in v {
+            acc |= (x as u128) << bits;
+            bits += w;
+            while bits >= 32 {
+                out.extend_from_slice(&(acc as u32).to_le_bytes());
+                acc >>= 32;
+                bits -= 32;
+            }
+        }
+    }
 }
 
 fn varint(out: &mut Vec<u8>, mut v: u64) {
@@ -53,6 +132,10 @@ fn varint(out: &mut Vec<u8>, mut v: u64) {
         v >>= 7;
     }
     out.push(v as u8);
+}
+
+fn zigzag(out: &mut Vec<u8>, v: i64) {
+    varint(out, ((v << 1) ^ (v >> 63)) as u64);
 }
 
 /// Thrift compact protocol, the parts Parquet metadata needs.
@@ -66,7 +149,7 @@ impl Thrift {
         Thrift { buf: Vec::new(), last: vec![0] }
     }
     fn zigzag(&mut self, v: i64) {
-        varint(&mut self.buf, ((v << 1) ^ (v >> 63)) as u64);
+        zigzag(&mut self.buf, v);
     }
     fn field(&mut self, id: i16, ty: u8) {
         let last = self.last.last_mut().unwrap();
@@ -124,28 +207,38 @@ fn physical(kind: Kind) -> i32 {
     }
 }
 
-/// Writes one file holding `rows` rows of `cols`, built in memory and written with one call.
+fn encoding(c: &Column) -> i32 {
+    match (c.enc, c.kind) {
+        (Enc::Plain, _) => 0,
+        (Enc::Delta, Kind::Str) => 6, // DELTA_LENGTH_BYTE_ARRAY
+        (Enc::Delta, _) => 5,         // DELTA_BINARY_PACKED
+    }
+}
+
+/// Writes one file holding `rows` rows of `cols`: headers and footer built in memory, the bodies written from
+/// where they are, all in one `writev`.
 pub fn write(path: &Path, rows: usize, cols: &[Column]) -> std::io::Result<()> {
-    let mut f = Vec::with_capacity(cols.iter().map(|c| c.body.len()).sum::<usize>() + 4096);
-    f.extend_from_slice(b"PAR1");
+    let mut heads = Vec::new(); // page header per column
     let mut chunks = Vec::new(); // (offset, size) of each column's page
+    let mut off = 4usize;
     if rows > 0 {
         for c in cols {
-            let off = f.len();
+            let size: usize = c.parts.iter().map(|p| p.len()).sum();
             let mut h = Thrift::new();
             h.i32(1, 0); // DATA_PAGE
-            h.i32(2, c.body.len() as i32);
-            h.i32(3, c.body.len() as i32);
+            h.i32(2, size as i32);
+            h.i32(3, size as i32);
             h.begin_struct(5); // DataPageHeader
             h.i32(1, rows as i32);
-            h.i32(2, 0); // PLAIN
+            h.i32(2, encoding(c));
             h.i32(3, 3); // definition levels: RLE
             h.i32(4, 3); // repetition levels: RLE
             h.end_struct();
             h.end_struct();
-            f.extend_from_slice(&h.buf);
-            f.extend_from_slice(c.body);
-            chunks.push((off as i64, (f.len() - off) as i64));
+            let total = h.buf.len() + size;
+            chunks.push((off as i64, total as i64));
+            off += total;
+            heads.push(h.buf);
         }
     }
     let mut t = Thrift::new(); // FileMetaData
@@ -184,8 +277,8 @@ pub fn write(path: &Path, rows: usize, cols: &[Column]) -> std::io::Result<()> {
             t.i64(2, off);
             t.begin_struct(3); // ColumnMetaData
             t.i32(1, physical(c.kind));
-            t.list(2, 5, 2); // encodings: PLAIN, RLE
-            t.zigzag(0);
+            t.list(2, 5, 2); // encodings: the data encoding, RLE
+            t.zigzag(encoding(c) as i64);
             t.zigzag(3);
             t.list(3, 8, 1); // path_in_schema
             varint(&mut t.buf, c.name.len() as u64);
@@ -204,10 +297,25 @@ pub fn write(path: &Path, rows: usize, cols: &[Column]) -> std::io::Result<()> {
     }
     t.bin(6, b"pipeline");
     t.end_struct();
-    f.extend_from_slice(&t.buf);
-    f.extend_from_slice(&(t.buf.len() as u32).to_le_bytes());
-    f.extend_from_slice(b"PAR1");
-    std::fs::File::create(path)?.write_all(&f)
+    let len = (t.buf.len() as u32).to_le_bytes();
+    let mut iov: Vec<IoSlice> = vec![IoSlice::new(b"PAR1")];
+    if rows > 0 {
+        for (c, h) in cols.iter().zip(&heads) {
+            iov.push(IoSlice::new(h));
+            iov.extend(c.parts.iter().map(|p| IoSlice::new(p)));
+        }
+    }
+    iov.extend([IoSlice::new(&t.buf), IoSlice::new(&len), IoSlice::new(b"PAR1")]);
+    let mut f = std::fs::File::create(path)?;
+    let mut bufs = &mut iov[..];
+    while !bufs.is_empty() {
+        let n = f.write_vectored(bufs)?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        IoSlice::advance_slices(&mut bufs, n);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -215,36 +323,51 @@ mod tests {
     use super::*;
 
     /// Writes sample tables under target/parquet-test{,-empty}; `scripts/check_parquet.py` reads them back.
+    /// The delta-encoded user table spans several 128-value blocks with negative and wide deltas.
     #[test]
     fn sample_tables() {
-        for (dir, rows) in [("target/parquet-test", 3usize), ("target/parquet-test-empty", 0)] {
-            let (mut ids, mut cats) = (Vec::new(), Vec::new());
-            let present = [true, false, true];
-            for (i, &p) in present.iter().enumerate().take(rows) {
-                put_str(&mut ids, [&b"u1"[..], b"A\tB", "é".as_bytes()][i]);
-                if p {
-                    put_str(&mut cats, [&b"shoes"[..], b"", b"unknown"][i]);
+        for (dir, rows) in [("target/parquet-test", 300usize), ("target/parquet-test-empty", 0)] {
+            let (mut idlen, mut idbytes, mut toplen, mut topbytes, mut bits) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), vec![0u8; rows.div_ceil(8)]);
+            let (mut ids, mut days, mut sess, mut rev) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            for i in 0..rows {
+                let id = [&b"u1"[..], b"A\tB", "é".as_bytes()][i % 3];
+                put_str(&mut ids, id);
+                idlen.push(id.len() as i32);
+                idbytes.extend_from_slice(id);
+                if i % 2 == 0 {
+                    let c = [&b"shoes"[..], b"", b"unknown"][i % 3];
+                    toplen.push(c.len() as i32);
+                    topbytes.extend_from_slice(c);
+                    bits[i / 8] |= 1 << (i % 8);
                 }
+                days.push(20730 + (i as i32 % 7) - 3);
+                sess.push((i as i32 * 7919) % 1000);
+                rev.push(if i % 5 == 0 { (i as i64) << 40 } else { -(i as i64) });
             }
-            let mut top = def_levels(&present[..rows]);
-            top.extend_from_slice(&cats);
-            let (days, sess, rev) = (vec![20730i32; rows], vec![1u32; rows], vec![1500i64; rows]);
+            let (idl, topl, dayd, sessd, revd) = (
+                delta(&idlen),
+                delta(&toplen),
+                delta(&days),
+                delta(&sess),
+                delta(&rev),
+            );
+            let def = def_levels(&bits, rows);
             let user = [
-                Column { name: "user_id", kind: Kind::Str, optional: false, body: &ids },
-                Column { name: "day", kind: Kind::Date, optional: false, body: plain(&days) },
-                Column { name: "sessions", kind: Kind::Int32, optional: false, body: plain(&sess) },
-                Column { name: "events", kind: Kind::Int32, optional: false, body: plain(&sess) },
-                Column { name: "revenue_cents", kind: Kind::Int64, optional: false, body: plain(&rev) },
-                Column { name: "top_category", kind: Kind::Str, optional: true, body: &top },
+                Column { name: "user_id", kind: Kind::Str, enc: Enc::Delta, optional: false, parts: &[&idl, &idbytes] },
+                Column { name: "day", kind: Kind::Date, enc: Enc::Delta, optional: false, parts: &[&dayd] },
+                Column { name: "sessions", kind: Kind::Int32, enc: Enc::Delta, optional: false, parts: &[&sessd] },
+                Column { name: "events", kind: Kind::Int32, enc: Enc::Plain, optional: false, parts: &[plain(&sess)] },
+                Column { name: "revenue_cents", kind: Kind::Int64, enc: Enc::Delta, optional: false, parts: &[&revd] },
+                Column { name: "top_category", kind: Kind::Str, enc: Enc::Delta, optional: true, parts: &[&def, &topl, &topbytes] },
             ];
             let camp = [
-                Column { name: "campaign_id", kind: Kind::Str, optional: false, body: &ids },
-                Column { name: "channel", kind: Kind::Str, optional: false, body: &ids },
-                Column { name: "day", kind: Kind::Date, optional: false, body: plain(&days) },
-                Column { name: "sessions", kind: Kind::Int64, optional: false, body: plain(&rev) },
-                Column { name: "purchasing_sessions", kind: Kind::Int64, optional: false, body: plain(&rev) },
-                Column { name: "revenue_cents", kind: Kind::Int64, optional: false, body: plain(&rev) },
-                Column { name: "assisted_sessions", kind: Kind::Int64, optional: false, body: plain(&rev) },
+                Column { name: "campaign_id", kind: Kind::Str, enc: Enc::Plain, optional: false, parts: &[&ids] },
+                Column { name: "channel", kind: Kind::Str, enc: Enc::Plain, optional: false, parts: &[&ids] },
+                Column { name: "day", kind: Kind::Date, enc: Enc::Plain, optional: false, parts: &[plain(&days)] },
+                Column { name: "sessions", kind: Kind::Int64, enc: Enc::Plain, optional: false, parts: &[plain(&rev)] },
+                Column { name: "purchasing_sessions", kind: Kind::Int64, enc: Enc::Plain, optional: false, parts: &[plain(&rev)] },
+                Column { name: "revenue_cents", kind: Kind::Int64, enc: Enc::Plain, optional: false, parts: &[plain(&rev)] },
+                Column { name: "assisted_sessions", kind: Kind::Int64, enc: Enc::Plain, optional: false, parts: &[plain(&rev)] },
             ];
             for (table, cols) in [("user_daily", &user[..]), ("campaign_daily", &camp[..])] {
                 let d = Path::new(dir).join(table);
