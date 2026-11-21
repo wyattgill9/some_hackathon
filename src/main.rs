@@ -21,7 +21,7 @@ use key::{Key, mix};
 use parquet::{Column, Kind};
 use person::Cell;
 use pool::Pool;
-use reader::{Line, Range, Reader};
+use reader::{Fields, Handler, Range, Reader};
 use ts::TsCache;
 use u64map::U64Map;
 
@@ -147,19 +147,11 @@ fn main() {
     let link_ranges = reader::ranges(&link_files, range);
     let next = AtomicUsize::new(0);
     let edges: Vec<Vec<(Key, Key)>> = parallel(threads, |_| {
-        let (mut rd, mut out) = (Reader::default(), Vec::new());
+        let (mut rd, mut out) = (Reader::default(), LinkLines(Vec::new()));
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
-            let Some(r) = link_ranges.get(i) else { break out };
-            rd.fields::<2>(&link_files[r.file].0, r, |l| {
-                let (a, b) = (l.get(0), l.get(1));
-                if !a.is_empty() && !b.is_empty() {
-                    let (ka, kb) = (key::pack(a), key::pack(b));
-                    if ka != kb {
-                        out.push((ka, kb));
-                    }
-                }
-            });
+            let Some(r) = link_ranges.get(i) else { break out.0 };
+            rd.fields::<2>(&link_files[r.file].0, r, &mut out);
         }
     });
     let links = links::Links::build(&edges, threads);
@@ -171,58 +163,32 @@ fn main() {
     tasks.extend(reader::ranges(&click_files, range).into_iter().map(|r| (false, r)));
     let next = AtomicUsize::new(0);
     let parsed: Vec<(Pool<Ev>, Pool<Ck>)> = parallel(threads, |_| {
-        let (mut rd, mut tc) = (Reader::default(), TsCache::default());
-        let (mut evs, mut cks) = (Pool::<Ev>::new(parts), Pool::<Ck>::new(parts));
-        // Records wait in a ring while the link-table line of their user ID is prefetched; the lookup happens
-        // PIPE lines later, by which time the line has arrived.
-        let (mut epipe, mut cpipe) = (Pipe::<Ev>::default(), Pipe::<Ck>::default());
-        let emit_ev = |mut e: Ev, evs: &mut Pool<Ev>| {
-            e.person = links.lookup(e.person);
-            let eid = e.eid;
-            evs.push((mix(eid) >> (64 - bits)) as usize, e);
-        };
-        let emit_ck = |mut c: Ck, cks: &mut Pool<Ck>| {
-            c.person = links.lookup(c.person);
-            cks.push((mix(c.person) >> (64 - bits)) as usize, c);
+        let mut rd = Reader::default();
+        let mut w = Parser {
+            ctx: &ctx,
+            cat_of: &cat_of,
+            camp_of: &camp_of,
+            camp_num: &camp_num,
+            links: &links,
+            tc: TsCache::default(),
+            evs: Pool::<Ev>::new(parts),
+            cks: Pool::<Ck>::new(parts),
+            epipe: Pipe::default(),
+            cpipe: Pipe::default(),
         };
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             let Some((is_event, r)) = tasks.get(i) else { break };
             if *is_event {
-                rd.fields::<7>(&event_files[r.file].0, r, |l| {
-                    let (slot, old) = epipe.slot();
-                    if parse_event(l, &ctx, &cat_of, &mut tc, slot) {
-                        let user = slot.person;
-                        links.prefetch(user);
-                        if let Some(old) = epipe.advance(old) {
-                            emit_ev(old, &mut evs);
-                        }
-                    }
-                });
+                rd.fields::<7>(&event_files[r.file].0, r, &mut w);
             } else {
-                rd.fields::<4>(&click_files[r.file].0, r, |l| {
-                    if let Some(c) = parse_click(l, &ctx, &camp_of, &camp_num, &mut tc) {
-                        links.prefetch(c.person);
-                        if let Some(old) = cpipe.push(c) {
-                            emit_ck(old, &mut cks);
-                        }
-                    }
-                });
+                rd.fields::<4>(&click_files[r.file].0, r, &mut w);
             }
         }
-        for e in epipe.drain() {
-            emit_ev(e, &mut evs);
-        }
-        for c in cpipe.drain() {
-            emit_ck(c, &mut cks);
-        }
-        evs.finish();
-        cks.finish();
-        (evs, cks)
+        w.finish()
     });
     let (evs, cks): (Vec<Pool<Ev>>, Vec<Pool<Ck>>) = parsed.into_iter().unzip();
     lap("parse");
-
     // Dedup per event partition: keep the copy with the smallest ingest_ts, emit it if valid, by person.
     let next = AtomicUsize::new(0);
     let ev2: Vec<Pool<Ev2>> = parallel(threads, |_| {
@@ -334,6 +300,88 @@ pub fn parallel<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
     })
 }
 
+/// The link lines of one thread as key pairs.
+struct LinkLines(Vec<(Key, Key)>);
+
+impl Handler<2> for LinkLines {
+    #[inline(always)]
+    fn line<'a>(&mut self, mut f: impl Fields<'a>) {
+        let (a, b) = (f.next(), f.next());
+        if !a.is_empty() && !b.is_empty() {
+            let (ka, kb) = (key::pack(a), key::pack(b));
+            if ka != kb {
+                self.0.push((ka, kb));
+            }
+        }
+    }
+}
+
+/// One thread's parse state. Records wait in a ring while the link-table line of their user ID is prefetched;
+/// the lookup happens PIPE lines later, by which time the line has arrived.
+struct Parser<'a> {
+    ctx: &'a Ctx,
+    cat_of: &'a U64Map,
+    camp_of: &'a U64Map,
+    camp_num: &'a [u32],
+    links: &'a links::Links,
+    tc: TsCache,
+    evs: Pool<Ev>,
+    cks: Pool<Ck>,
+    epipe: Pipe<Ev>,
+    cpipe: Pipe<Ck>,
+}
+
+impl Parser<'_> {
+    #[inline(always)]
+    fn emit_ev(&mut self, mut e: Ev) {
+        e.person = self.links.lookup(e.person);
+        let eid = e.eid;
+        self.evs.push((mix(eid) >> (64 - self.ctx.bits)) as usize, e);
+    }
+
+    #[inline(always)]
+    fn emit_ck(&mut self, mut c: Ck) {
+        c.person = self.links.lookup(c.person);
+        self.cks.push((mix(c.person) >> (64 - self.ctx.bits)) as usize, c);
+    }
+
+    fn finish(mut self) -> (Pool<Ev>, Pool<Ck>) {
+        for e in self.epipe.drain().collect::<Vec<_>>() {
+            self.emit_ev(e);
+        }
+        for c in self.cpipe.drain().collect::<Vec<_>>() {
+            self.emit_ck(c);
+        }
+        self.evs.finish();
+        self.cks.finish();
+        (self.evs, self.cks)
+    }
+}
+
+impl Handler<7> for Parser<'_> {
+    #[inline(always)]
+    fn line<'a>(&mut self, f: impl Fields<'a>) {
+        if let Some(e) = parse_event(f, self.ctx, self.cat_of, &mut self.tc) {
+            self.links.prefetch(e.person);
+            if let Some(old) = self.epipe.push(e) {
+                self.emit_ev(old);
+            }
+        }
+    }
+}
+
+impl Handler<4> for Parser<'_> {
+    #[inline(always)]
+    fn line<'a>(&mut self, f: impl Fields<'a>) {
+        if let Some(c) = parse_click(f, self.ctx, self.camp_of, self.camp_num, &mut self.tc) {
+            self.links.prefetch(c.person);
+            if let Some(old) = self.cpipe.push(c) {
+                self.emit_ck(old);
+            }
+        }
+    }
+}
+
 /// A fixed-size delay line: `push` returns the record pushed PIPE calls earlier.
 struct Pipe<T: Copy> {
     ring: [T; PIPE],
@@ -353,19 +401,7 @@ impl<T: Copy> Default for Pipe<T> {
 impl<T: Copy> Pipe<T> {
     #[inline(always)]
     fn push(&mut self, v: T) -> Option<T> {
-        let (slot, old) = self.slot();
-        *slot = v;
-        self.advance(old)
-    }
-    /// The slot the next record is built in, and what it held.
-    #[inline(always)]
-    fn slot(&mut self) -> (&mut T, T) {
-        let old = self.ring[self.at];
-        (&mut self.ring[self.at], old)
-    }
-    /// After the slot was filled: the record pushed PIPE calls earlier, once the ring is full.
-    #[inline(always)]
-    fn advance(&mut self, old: T) -> Option<T> {
+        let old = std::mem::replace(&mut self.ring[self.at], v);
         self.at = (self.at + 1) % PIPE;
         if self.filled < PIPE {
             self.filled += 1;
@@ -381,16 +417,16 @@ impl<T: Copy> Pipe<T> {
     }
 }
 
-/// Fills `e` from a line; false if the line yields no copy. Its `person` is still the user ID: the caller
-/// resolves it through the link table.
+/// The copy a line yields, if any. Its `person` is still the user ID: the caller resolves it through the link
+/// table.
 #[inline(always)]
-fn parse_event(l: &Line, ctx: &Ctx, cat_of: &U64Map, tc: &mut TsCache, e: &mut Ev) -> bool {
-    let id = l.get(0);
+fn parse_event<'a>(mut f: impl Fields<'a>, ctx: &Ctx, cat_of: &U64Map, tc: &mut TsCache) -> Option<Ev> {
+    let id = f.next();
     if id.is_empty() {
-        return false;
+        return None;
     }
-    let (user, ts, ingest, kind) = (l.get(1), l.get(2), l.get(3), l.get(4));
-    // Fields point into the reader's buffer, which keeps 64 readable bytes past the data.
+    let (user, ts, ingest, kind) = (f.next(), f.next(), f.next(), f.next());
+    // Fields point into the reader's buffer, which keeps readable bytes past the data.
     let t = unsafe { tc.parse_raw(ts.as_ptr(), ts.len()) }.filter(|&t| t >= ctx.ws && t < ctx.we);
     // ponytail: rules.md guarantees ingest_ts is valid F1; a bad one sorts last and fails the late check.
     let ing = unsafe { tc.parse_raw(ingest.as_ptr(), ingest.len()) }.unwrap_or(i64::MAX);
@@ -400,28 +436,29 @@ fn parse_event(l: &Line, ctx: &Ctx, cat_of: &U64Map, tc: &mut TsCache, e: &mut E
             let k = u32::from_le_bytes(kind.try_into().unwrap());
             (k == u32::from_le_bytes(*b"view")) | (k == u32::from_le_bytes(*b"cart"))
         });
-    let product = l.get(5);
+    let (product, price) = (f.next(), f.next());
     let mut valid = !user.is_empty() && !product.is_empty() && kind_ok && t.is_some_and(|t| ing - t <= DAY);
     let mut pay = 0;
     if valid && purchase {
-        match parse::price(l.get(6)) {
+        match parse::price(price) {
             Some(v) => pay = v | cat_of.get(unsafe { key::pack16(product.as_ptr(), product.len()) }).unwrap_or(ctx.unknown) << 24,
             None => valid = false,
         }
     }
-    e.eid = unsafe { key::pack16(id.as_ptr(), id.len()) };
-    e.person = if valid { unsafe { key::pack16(user.as_ptr(), user.len()) } } else { 0 };
-    // F1 is whole seconds, so / is exact; biased by 2^31 so copies compare right for ±68 years.
-    e.ingest = (ing / 1000 - ctx.cws_s + (1 << 31)).clamp(0, u32::MAX as i64) as u32;
-    e.ts = t.map_or(0, |t| (t - ctx.cws) as u32);
-    e.pay = pay | if valid { VALID } else { 0 };
-    true
+    Some(Ev {
+        eid: unsafe { key::pack16(id.as_ptr(), id.len()) },
+        person: if valid { unsafe { key::pack16(user.as_ptr(), user.len()) } } else { 0 },
+        // F1 is whole seconds, so / is exact; biased by 2^31 so copies compare right for ±68 years.
+        ingest: (ing / 1000 - ctx.cws_s + (1 << 31)).clamp(0, u32::MAX as i64) as u32,
+        ts: t.map_or(0, |t| (t - ctx.cws) as u32),
+        pay: pay | if valid { VALID } else { 0 },
+    })
 }
 
 /// The click's `person` is still its user ID: the caller resolves it through the link table.
-#[inline]
-fn parse_click(l: &Line, ctx: &Ctx, camp_of: &U64Map, camp_num: &[u32], tc: &mut TsCache) -> Option<Ck> {
-    let (id, user, camp, ts) = (l.get(0), l.get(1), l.get(2), l.get(3));
+#[inline(always)]
+fn parse_click<'a>(mut f: impl Fields<'a>, ctx: &Ctx, camp_of: &U64Map, camp_num: &[u32], tc: &mut TsCache) -> Option<Ck> {
+    let (id, user, camp, ts) = (f.next(), f.next(), f.next(), f.next());
     if id.is_empty() || user.is_empty() {
         return None;
     }
