@@ -178,6 +178,16 @@ fn eight(w: u64) -> Option<u64> {
     digits8(w ^ 0x3030_3030_3030_3030)
 }
 
+/// 1 to 7 ASCII digits at `p` as a number: one 8-byte load, the digits moved to the top and '0' filled below.
+///
+/// # Safety
+/// `p[..8]` must be readable; `len` must be 1..=7.
+#[inline(always)]
+pub(crate) unsafe fn digits8_at(p: *const u8, len: usize) -> Option<u64> {
+    let w = unsafe { (p as *const u64).read_unaligned() };
+    eight(w << (64 - 8 * len) | 0x3030_3030_3030_3030 >> (8 * len))
+}
+
 /// Eight digit values (byte 0 the most significant, each 0..=9 after the xor with '0') as a number.
 #[inline(always)]
 fn digits8(x: u64) -> Option<u64> {

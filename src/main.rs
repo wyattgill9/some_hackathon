@@ -291,6 +291,19 @@ fn numbered(id: &[u8], prefix: &[u8]) -> Option<usize> {
     Some(n)
 }
 
+/// `numbered(id, b"c_")` for a field in the reader's buffer: the digits go through the SWAR parser.
+///
+/// # Safety
+/// 8 bytes from `id[2]` must be readable.
+#[inline(always)]
+unsafe fn campaign_number(id: &[u8]) -> Option<usize> {
+    let n = id.len().wrapping_sub(2);
+    if n.wrapping_sub(1) >= 7 || id[0] != b'c' || id[1] != b'_' || (id[2] == b'0' && n > 1) {
+        return None;
+    }
+    unsafe { ts::digits8_at(id.as_ptr().add(2), n) }.map(|v| v as usize)
+}
+
 /// `n` threads running `f(thread index)`; their results in order.
 pub fn parallel<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
     std::thread::scope(|s| {
@@ -463,7 +476,7 @@ fn parse_click<'a>(mut f: impl Fields<'a>, ctx: &Ctx, camp_of: &U64Map, camp_num
         return None;
     }
     let t = unsafe { tc.parse_raw(ts.as_ptr(), ts.len()) }.filter(|&t| t >= ctx.cws && t < ctx.we)?;
-    let camp = match numbered(camp, b"c_").and_then(|n| camp_num.get(n)).copied() {
+    let camp = match unsafe { campaign_number(camp) }.and_then(|n| camp_num.get(n)).copied() {
         Some(i) if i != 0 => i - 1,
         _ => camp_of.get(unsafe { key::pack16(camp.as_ptr(), camp.len()) })?,
     };
@@ -535,4 +548,35 @@ fn manifest_ts(m: &[u8], key: &str) -> i64 {
 fn lines(f: &[u8]) -> impl Iterator<Item = &[u8]> {
     let body = f.iter().position(|&b| b == b'\n').map_or(&[][..], |i| &f[i + 1..]);
     body.strip_suffix(b"\n").unwrap_or(body).split(|&b| b == b'\n').filter(move |_| !body.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn campaign_number_matches_numbered() {
+        let mut rng = 0x5151_a2a2_b3b3_c4c4u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut buf = vec![b','; 32];
+        for _ in 0..100_000 {
+            let n = (next() % 11) as usize;
+            for (i, b) in buf[..n].iter_mut().enumerate() {
+                *b = match (i, next() % 12) {
+                    (0, 0..=9) => b'c',
+                    (1, 0..=9) => b'_',
+                    (_, 0..=7) => b'0' + (next() % 10) as u8,
+                    (_, 8) => b'0',
+                    _ => b"Cc_ \r\xd9x/"[(next() % 8) as usize],
+                };
+            }
+            let id = &buf[..n];
+            assert_eq!(unsafe { campaign_number(id) }, numbered(id, b"c_"), "{:?}", String::from_utf8_lossy(id));
+        }
+    }
 }
