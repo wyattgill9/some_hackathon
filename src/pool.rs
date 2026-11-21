@@ -18,8 +18,7 @@ pub struct Pool<T: Copy, const S: usize = 64> {
     cap: usize, // records per block, a multiple of the records per stage
     stage: Vec<Stage<S>>,
     fill: Vec<u8>, // records staged, per partition: the one array every push touches is 1 byte a partition
-    cur: Vec<*mut T>, // the open block, null before the first flush
-    used: Vec<u32>, // records in the open block
+    at: Vec<[*mut T; 2]>, // the open block's write pointer and end, null before the first flush
     done: Vec<Vec<(*mut T, u32)>>,
     region: *mut u8,
     region_used: usize,
@@ -42,8 +41,7 @@ impl<T: Copy, const S: usize> Pool<T, S> {
             cap: (BLOCK / size_of::<T>()) / Self::PER * Self::PER,
             stage: vec![Stage([0; S]); parts],
             fill: vec![0; parts],
-            cur: vec![std::ptr::null_mut(); parts],
-            used: vec![0; parts],
+            at: vec![[std::ptr::null_mut(); 2]; parts],
             done: (0..parts).map(|_| Vec::new()).collect(),
             region: std::ptr::null_mut(),
             region_used: 0,
@@ -72,24 +70,22 @@ impl<T: Copy, const S: usize> Pool<T, S> {
     #[inline(always)]
     fn flush(&mut self, p: usize, last: &T) {
         unsafe {
-            let used = *self.used.get_unchecked(p) as usize;
-            let cur = *self.cur.get_unchecked(p);
-            if cur.is_null() || used + Self::PER > self.cap {
+            let [w, end] = *self.at.get_unchecked(p);
+            if w == end {
                 self.new_block(p);
                 return self.flush(p, last);
             }
-            let dst = cur.add(used) as *mut u8;
-            *self.used.get_unchecked_mut(p) = (used + Self::PER) as u32;
+            self.at.get_unchecked_mut(p)[0] = w.add(Self::PER);
             *self.fill.get_unchecked_mut(p) = 0;
-            stream::<T, S>(self.stage.get_unchecked(p).0.as_ptr(), last as *const T as *const u8, dst);
+            stream::<T, S>(self.stage.get_unchecked(p).0.as_ptr(), last as *const T as *const u8, w as *mut u8);
         }
     }
 
     #[cold]
     #[inline(never)]
     fn new_block(&mut self, p: usize) {
-        if !self.cur[p].is_null() {
-            self.done[p].push((self.cur[p], self.used[p]));
+        if let Some(b) = self.open(p) {
+            self.done[p].push(b);
         }
         if self.region_used + BLOCK > self.region_len {
             match self.spare.pop() {
@@ -102,8 +98,8 @@ impl<T: Copy, const S: usize> Pool<T, S> {
             }
             self.region_used = 0;
         }
-        self.cur[p] = unsafe { self.region.add(self.region_used) } as *mut T;
-        self.used[p] = 0;
+        let start = unsafe { self.region.add(self.region_used) } as *mut T;
+        self.at[p] = [start, unsafe { start.add(self.cap) }];
         self.region_used += BLOCK;
     }
 
@@ -120,11 +116,12 @@ impl<T: Copy, const S: usize> Pool<T, S> {
             if f == 0 {
                 continue;
             }
-            if self.cur[p].is_null() || self.used[p] as usize + f > self.cap {
+            if self.at[p][1].is_null() || unsafe { self.at[p][1].offset_from(self.at[p][0]) } < f as isize {
                 self.new_block(p);
             }
-            unsafe { std::ptr::copy_nonoverlapping(self.stage[p].0.as_ptr() as *const T, self.cur[p].add(self.used[p] as usize), f) };
-            self.used[p] += f as u32;
+            let w = self.at[p][0];
+            unsafe { std::ptr::copy_nonoverlapping(self.stage[p].0.as_ptr() as *const T, w, f) };
+            self.at[p][0] = unsafe { w.add(f) };
             self.fill[p] = 0;
         }
         #[cfg(target_feature = "avx2")]
@@ -140,14 +137,22 @@ impl<T: Copy, const S: usize> Pool<T, S> {
         }
     }
 
+    /// The open block: its start and the records in it.
+    fn open(&self, p: usize) -> Option<(*mut T, u32)> {
+        let [w, end] = self.at[p];
+        (!end.is_null()).then(|| {
+            let start = unsafe { end.sub(self.cap) };
+            (start, unsafe { w.offset_from(start) } as u32)
+        })
+    }
+
     pub fn len(&self, p: usize) -> usize {
-        self.done[p].iter().map(|b| b.1 as usize).sum::<usize>() + self.used[p] as usize
+        self.done[p].iter().map(|b| b.1 as usize).sum::<usize>() + self.open(p).map_or(0, |b| b.1 as usize)
     }
 
     /// The partition's records, block by block.
     pub fn blocks(&self, p: usize) -> impl Iterator<Item = &[T]> {
-        let cur = (!self.cur[p].is_null()).then_some((self.cur[p], self.used[p]));
-        self.done[p].iter().copied().chain(cur).map(|(b, n)| unsafe { std::slice::from_raw_parts(b, n as usize) })
+        self.done[p].iter().copied().chain(self.open(p)).map(|(b, n)| unsafe { std::slice::from_raw_parts(b, n as usize) })
     }
 }
 

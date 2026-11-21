@@ -462,7 +462,7 @@ fn parse_click(l: &Line, ctx: &Ctx, camp_of: &U64Map, camp_num: &[u32], tc: &mut
     })
 }
 
-/// A line of the dedup table: 16 slots of `tag << 20 | position`, 0 when empty.
+/// A line of the dedup table: a count, then 15 slots of `tag << 20 | position`, filled in order.
 #[derive(Clone, Copy)]
 #[repr(C, align(64))]
 pub struct TLine([u32; 16]);
@@ -472,10 +472,10 @@ const POS_BITS: u32 = 20;
 const POS_MASK: u32 = (1 << POS_BITS) - 1;
 
 /// One event partition: the key stream and the payload stream, parallel, read in place from their blocks.
-/// The key pass walks every (event_id, ingest) through an open-addressing table whose 16-slot lines are probed
-/// with one compare each: a copy whose event_id is already in the table loses to the copy there or replaces
-/// it, and the loser's position goes into a bitmap. The payload pass then copies every valid, undropped
-/// payload to its person's partition. Copies with equal ingest are identical, so ties are immaterial.
+/// The key pass walks every (event_id, ingest) through an open-addressing table whose lines of 15 slots are
+/// probed with one compare each: a copy whose event_id is already in the table loses to the copy there or
+/// replaces it, and the loser's position goes into a bitmap. The payload pass then copies every valid,
+/// undropped payload to its person's partition. Copies with equal ingest are identical, so ties are immaterial.
 fn dedup(keys: &[&[EvKey]], pays: &[&[Ev2]], table: &mut Vec<TLine>, dropped: &mut Vec<u64>, bits: u32, out: &mut Pool<Ev2, EV_STAGE>) {
     let n: usize = keys.iter().map(|b| b.len()).sum();
     if n == 0 {
@@ -487,23 +487,24 @@ fn dedup(keys: &[&[EvKey]], pays: &[&[Ev2]], table: &mut Vec<TLine>, dropped: &m
     if keys.len() > 1 << (POS_BITS - 10) {
         dedup_big(keys, dropped);
     } else {
-        // Lines of 16 slots at a load of 31-62%: a line is rarely full, and then the next one is probed.
+        // Lines of 15 slots at a load of 33-67%: a line is rarely full, and then the next one is probed.
         let lines = (n / 10).next_power_of_two().max(2);
-        let lshift = 64 - lines.trailing_zeros();
+        // The partition took the top `bits` of the hash; the line takes the next ones, the tag 12 more.
+        let lsh = 64 - bits - lines.trailing_zeros();
+        let tsh = lsh.saturating_sub(12);
         table.clear();
         table.resize(lines, TLine([0; 16]));
         for (b, blk) in keys.iter().enumerate() {
             for (j, r) in blk.iter().enumerate() {
                 let pos = (b << 10 | j) as u32;
-                // The partition took the top `bits` of the hash; the line takes the next ones, the tag 12 more.
-                let h = mix(r.eid) << bits;
-                let tag = ((h << (64 - lshift)) >> 52) as u32 | 1;
-                let mut li = (h >> lshift) as usize;
+                let h = mix(r.eid);
+                let tag = (h >> tsh) as u32 & 0xfff | 1;
+                let mut li = (h >> lsh) as usize & (lines - 1);
                 // In bounds: li is masked, positions come from this walk, and the table is never full.
                 unsafe {
                     loop {
                         let line = table.as_mut_ptr().add(li);
-                        let (mut found, empty) = probe(line, tag);
+                        let mut found = probe(line, tag);
                         while found != 0 {
                             let s = found.trailing_zeros() as usize;
                             let q = (*line).0[s] & POS_MASK;
@@ -523,8 +524,10 @@ fn dedup(keys: &[&[EvKey]], pays: &[&[Ev2]], table: &mut Vec<TLine>, dropped: &m
                         if found != 0 {
                             break;
                         }
-                        if empty != 0 {
-                            (*line).0[empty.trailing_zeros() as usize] = tag << POS_BITS | pos;
+                        let count = (*line).0[0] as usize;
+                        if count < 15 {
+                            (*line).0[count + 1] = tag << POS_BITS | pos;
+                            (*line).0[0] = count as u32 + 1;
                             break;
                         }
                         li = (li + 1) & (lines - 1);
@@ -534,18 +537,22 @@ fn dedup(keys: &[&[EvKey]], pays: &[&[Ev2]], table: &mut Vec<TLine>, dropped: &m
         }
     }
     for (b, blk) in pays.iter().enumerate() {
-        for (j, e) in blk.iter().enumerate() {
-            let pos = b << 10 | j;
-            if e.person != 0 && dropped[pos >> 6] >> (pos & 63) & 1 == 0 {
-                out.push((mix(e.person) >> (64 - bits)) as usize, *e);
+        for (c, chunk) in blk.chunks(64).enumerate() {
+            let mut word = dropped[b << 4 | c];
+            for e in chunk {
+                let keep = e.person != 0 && word & 1 == 0;
+                word >>= 1;
+                if keep {
+                    out.push((mix(e.person) >> (64 - bits)) as usize, *e);
+                }
             }
         }
     }
 }
 
-/// The slots of `line` holding `tag`, and the empty ones, as bit masks.
+/// The slots of `line` holding `tag`, as a bit mask (bit 0, the count, never matches: tags are nonzero).
 #[inline(always)]
-unsafe fn probe(line: *const TLine, tag: u32) -> (u32, u32) {
+unsafe fn probe(line: *const TLine, tag: u32) -> u32 {
     #[cfg(target_feature = "avx2")]
     unsafe {
         use std::arch::x86_64::*;
@@ -553,21 +560,16 @@ unsafe fn probe(line: *const TLine, tag: u32) -> (u32, u32) {
         let hi = _mm256_load_si256((line as *const __m256i).add(1));
         let t = _mm256_set1_epi32((tag << POS_BITS) as i32);
         let m = _mm256_set1_epi32(!POS_MASK as i32);
-        let f = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(_mm256_and_si256(lo, m), t))) as u32
-            | (_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(_mm256_and_si256(hi, m), t))) as u32) << 8;
-        let z = _mm256_setzero_si256();
-        let e = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(lo, z))) as u32
-            | (_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(hi, z))) as u32) << 8;
-        (f, e)
+        _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(_mm256_and_si256(lo, m), t))) as u32
+            | (_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(_mm256_and_si256(hi, m), t))) as u32) << 8
     }
     #[cfg(not(target_feature = "avx2"))]
     unsafe {
-        let (mut f, mut e) = (0, 0);
+        let mut f = 0;
         for (s, &v) in (*line).0.iter().enumerate() {
             f |= ((v >> POS_BITS == tag) as u32) << s;
-            e |= ((v == 0) as u32) << s;
         }
-        (f, e)
+        f
     }
 }
 
