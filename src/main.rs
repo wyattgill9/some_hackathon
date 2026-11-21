@@ -28,23 +28,29 @@ use u64map::U64Map;
 pub const DAY: i64 = 86_400_000;
 pub const WEEK: i64 = 7 * DAY;
 pub const GAP: i64 = 1_800_000;
+/// Staging bytes per partition of the event streams and of the click stream (see pool.rs).
+const EV_STAGE: usize = 64;
+const CK_STAGE: usize = 192;
 
-/// A parsed event copy, 28 bytes. Times are relative to `cws` (window_start - 7 d): `ts` in ms, `ingest` in
-/// seconds biased by 2^31. `pay` = price | category << 24 for a purchase, else 0, with bit 31 = valid and not
-/// late (categories therefore use 7 bits).
+/// A parsed event copy as the parser builds it: the dedup key (`eid`, `ingest` in ms since the epoch) and the
+/// payload, which go to two parallel record streams of the event's partition.
 #[derive(Clone, Copy)]
-#[repr(C, packed)]
-pub struct Ev {
-    eid: Key,
-    person: Key,
-    ingest: u32,
-    ts: u32,
-    pay: u32,
+struct Ev {
+    key: EvKey,
+    pay: Ev2,
 }
 
-const VALID: u32 = 1 << 31;
+/// What dedup compares: copies of an event share `eid`; the one with the smallest `ingest` wins.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct EvKey {
+    eid: Key,
+    ingest: i64,
+}
 
-/// A surviving event.
+/// An event's payload, and a surviving event. `person` is 0 when the copy is invalid or late (a valid event's
+/// user ID is never empty). `ts` is in ms relative to `cws` (window_start - 7 d). `pay` = price | category << 24
+/// for a purchase, else 0.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct Ev2 {
@@ -53,7 +59,7 @@ pub struct Ev2 {
     pub pay: u32,
 }
 
-/// A valid click.
+/// A valid click, 24 bytes: eight per three staging lines.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct Ck {
@@ -67,7 +73,6 @@ pub struct Ctx {
     pub ws: i64,
     pub we: i64,
     pub cws: i64,
-    pub cws_s: i64,
     pub day0: i64,
     pub ndays: usize,
     pub bits: u32,
@@ -138,7 +143,7 @@ fn main() {
     let bits = env("SS_PBITS").map_or(((event_bytes >> 21).next_power_of_two().trailing_zeros()).clamp(4, 11), |b| b as u32);
     let parts = 1usize << bits;
     let range = env("SS_RANGE").unwrap_or(256 << 10);
-    let ctx = Ctx { ws, we, cws, cws_s: cws.div_euclid(1000), day0, ndays, bits, ncamp, cats: cats.iter().map(|c| c.to_vec()).collect(), unknown };
+    let ctx = Ctx { ws, we, cws, day0, ndays, bits, ncamp, cats: cats.iter().map(|c| c.to_vec()).collect(), unknown };
     fs::create_dir_all(out.join("user_daily")).unwrap();
     fs::create_dir_all(out.join("campaign_daily")).unwrap();
     lap("setup");
@@ -170,21 +175,13 @@ fn main() {
     let mut tasks: Vec<(bool, Range)> = reader::ranges(&event_files, range).into_iter().map(|r| (true, r)).collect();
     tasks.extend(reader::ranges(&click_files, range).into_iter().map(|r| (false, r)));
     let next = AtomicUsize::new(0);
-    let parsed: Vec<(Pool<Ev>, Pool<Ck>)> = parallel(threads, |_| {
+    let parsed: Vec<(Pool<EvKey, EV_STAGE>, Pool<Ev2, EV_STAGE>, Pool<Ck, CK_STAGE>)> = parallel(threads, |_| {
         let (mut rd, mut tc) = (Reader::default(), TsCache::default());
-        let (mut evs, mut cks) = (Pool::<Ev>::new(parts), Pool::<Ck>::new(parts));
+        let mut evs = (Pool::<EvKey, EV_STAGE>::new(parts), Pool::<Ev2, EV_STAGE>::new(parts));
+        let mut cks = Pool::<Ck, CK_STAGE>::new(parts);
         // Records wait in a ring while the link-table line of their user ID is prefetched; the lookup happens
         // PIPE lines later, by which time the line has arrived.
         let (mut epipe, mut cpipe) = (Pipe::<Ev>::default(), Pipe::<Ck>::default());
-        let emit_ev = |mut e: Ev, evs: &mut Pool<Ev>| {
-            e.person = links.lookup(e.person);
-            let eid = e.eid;
-            evs.push((mix(eid) >> (64 - bits)) as usize, e);
-        };
-        let emit_ck = |mut c: Ck, cks: &mut Pool<Ck>| {
-            c.person = links.lookup(c.person);
-            cks.push((mix(c.person) >> (64 - bits)) as usize, c);
-        };
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             let Some((is_event, r)) = tasks.get(i) else { break };
@@ -192,10 +189,10 @@ fn main() {
                 rd.fields::<7>(&event_files[r.file].0, r, |l| {
                     let (slot, old) = epipe.slot();
                     if parse_event(l, &ctx, &cat_of, &mut tc, slot) {
-                        let user = slot.person;
+                        let user = slot.pay.person;
                         links.prefetch(user);
                         if let Some(old) = epipe.advance(old) {
-                            emit_ev(old, &mut evs);
+                            emit_ev(old, &links, bits, &mut evs);
                         }
                     }
                 });
@@ -204,37 +201,48 @@ fn main() {
                     if let Some(c) = parse_click(l, &ctx, &camp_of, &camp_num, &mut tc) {
                         links.prefetch(c.person);
                         if let Some(old) = cpipe.push(c) {
-                            emit_ck(old, &mut cks);
+                            emit_ck(old, &links, bits, &mut cks);
                         }
                     }
                 });
             }
         }
         for e in epipe.drain() {
-            emit_ev(e, &mut evs);
+            emit_ev(e, &links, bits, &mut evs);
         }
         for c in cpipe.drain() {
-            emit_ck(c, &mut cks);
+            emit_ck(c, &links, bits, &mut cks);
         }
-        evs.finish();
+        evs.0.finish();
+        evs.1.finish();
         cks.finish();
-        (evs, cks)
+        (evs.0, evs.1, cks)
     });
-    let (evs, cks): (Vec<Pool<Ev>>, Vec<Pool<Ck>>) = parsed.into_iter().unzip();
+    let (mut evk, mut evp, mut cks) = (Vec::new(), Vec::new(), Vec::new());
+    for (k, p, c) in parsed {
+        evk.push(k);
+        evp.push(p);
+        cks.push(c);
+    }
     lap("parse");
 
-    // Dedup per event partition: keep the copy with the smallest ingest_ts, emit it if valid, by person.
+    // Dedup per event partition: keep the copy with the smallest ingest_ts, emit it if valid, by person. The
+    // output blocks are carved from the partition's consumed input blocks.
     let next = AtomicUsize::new(0);
-    let ev2: Vec<Pool<Ev2>> = parallel(threads, |_| {
-        let (mut filter, mut suspects) = (Vec::new(), Vec::new());
-        let mut out = Pool::<Ev2>::new(parts);
+    let ev2: Vec<Pool<Ev2, EV_STAGE>> = parallel(threads, |_| {
+        let (mut table, mut dropped) = (Vec::new(), Vec::new());
+        let mut out = Pool::<Ev2, EV_STAGE>::new(parts);
         loop {
             let p = next.fetch_add(1, Ordering::Relaxed);
             if p >= parts {
                 break;
             }
-            let blocks: Vec<&[Ev]> = evs.iter().flat_map(|t| t.blocks(p)).collect();
-            dedup(&blocks, &mut filter, &mut suspects, bits, &mut out);
+            let keys: Vec<&[EvKey]> = evk.iter().flat_map(|t| t.blocks(p)).collect();
+            let pays: Vec<&[Ev2]> = evp.iter().flat_map(|t| t.blocks(p)).collect();
+            dedup(&keys, &pays, &mut table, &mut dropped, bits, &mut out);
+            for b in keys.iter().map(|b| b.as_ptr() as *mut u8).chain(pays.iter().map(|b| b.as_ptr() as *mut u8)) {
+                out.recycle(b);
+            }
         }
         out.finish();
         out
@@ -301,7 +309,8 @@ fn main() {
     lap(&format!("write: {rows} user rows, {} campaign rows; sessions {cs}, revenue {cr}", days.len()));
     // Nothing is dropped; the big mappings are released on all threads so exit does not tear them down on one.
     parallel(threads, |t| {
-        evs[t].release();
+        evk[t].release();
+        evp[t].release();
         cks[t].release();
         ev2[t].release();
     });
@@ -409,13 +418,28 @@ fn parse_event(l: &Line, ctx: &Ctx, cat_of: &U64Map, tc: &mut TsCache, e: &mut E
             None => valid = false,
         }
     }
-    e.eid = unsafe { key::pack16(id.as_ptr(), id.len()) };
-    e.person = if valid { unsafe { key::pack16(user.as_ptr(), user.len()) } } else { 0 };
-    // F1 is whole seconds, so / is exact; biased by 2^31 so copies compare right for ±68 years.
-    e.ingest = (ing / 1000 - ctx.cws_s + (1 << 31)).clamp(0, u32::MAX as i64) as u32;
-    e.ts = t.map_or(0, |t| (t - ctx.cws) as u32);
-    e.pay = pay | if valid { VALID } else { 0 };
+    e.key.eid = unsafe { key::pack16(id.as_ptr(), id.len()) };
+    e.key.ingest = ing;
+    e.pay.person = if valid { unsafe { key::pack16(user.as_ptr(), user.len()) } } else { 0 };
+    e.pay.ts = t.map_or(0, |t| (t - ctx.cws) as u32);
+    e.pay.pay = pay;
     true
+}
+
+/// An event copy, its user ID resolved to its person, into its event partition's key and payload streams.
+#[inline(always)]
+fn emit_ev(e: Ev, links: &links::Links, bits: u32, (keys, pays): &mut (Pool<EvKey, EV_STAGE>, Pool<Ev2, EV_STAGE>)) {
+    let p = (mix(e.key.eid) >> (64 - bits)) as usize;
+    keys.push(p, e.key);
+    // Built in registers: a wide load of a record patched in memory would wait for the patch to retire.
+    pays.push(p, Ev2 { person: links.lookup(e.pay.person), ts: e.pay.ts, pay: e.pay.pay });
+}
+
+/// A click, its user ID resolved to its person, into its person partition.
+#[inline(always)]
+fn emit_ck(c: Ck, links: &links::Links, bits: u32, cks: &mut Pool<Ck, CK_STAGE>) {
+    let person = links.lookup(c.person);
+    cks.push((mix(person) >> (64 - bits)) as usize, Ck { person, cid: c.cid, ts: c.ts, camp: c.camp });
 }
 
 /// The click's `person` is still its user ID: the caller resolves it through the link table.
@@ -438,51 +462,124 @@ fn parse_click(l: &Line, ctx: &Ctx, camp_of: &U64Map, camp_num: &[u32], tc: &mut
     })
 }
 
-/// One event partition, read in place from its blocks. A two-bit counter per hash slot (32 slots per copy)
-/// tells which event_ids were seen more than once: the others, nearly all of them, are emitted straight from
-/// the second pass; the suspects are sorted by event_id and the copy with the smallest ingest of each wins.
-/// Valid winners go to their person's partition. Copies with equal ingest are identical, so ties are immaterial.
-fn dedup(blocks: &[&[Ev]], filter: &mut Vec<u64>, suspects: &mut Vec<Ev>, bits: u32, out: &mut Pool<Ev2>) {
-    let n: usize = blocks.iter().map(|b| b.len()).sum();
+/// A line of the dedup table: 16 slots of `tag << 20 | position`, 0 when empty.
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+pub struct TLine([u32; 16]);
+
+/// A record's position in its partition: block index << 10 | index in the block (blocks hold at most 1024).
+const POS_BITS: u32 = 20;
+const POS_MASK: u32 = (1 << POS_BITS) - 1;
+
+/// One event partition: the key stream and the payload stream, parallel, read in place from their blocks.
+/// The key pass walks every (event_id, ingest) through an open-addressing table whose 16-slot lines are probed
+/// with one compare each: a copy whose event_id is already in the table loses to the copy there or replaces
+/// it, and the loser's position goes into a bitmap. The payload pass then copies every valid, undropped
+/// payload to its person's partition. Copies with equal ingest are identical, so ties are immaterial.
+fn dedup(keys: &[&[EvKey]], pays: &[&[Ev2]], table: &mut Vec<TLine>, dropped: &mut Vec<u64>, bits: u32, out: &mut Pool<Ev2, EV_STAGE>) {
+    let n: usize = keys.iter().map(|b| b.len()).sum();
     if n == 0 {
         return;
     }
-    let slots = (n * 32).next_power_of_two().max(64);
-    let shift = 64 - slots.trailing_zeros();
-    filter.clear();
-    filter.resize(slots / 32, 0);
-    for r in blocks.iter().flat_map(|b| b.iter()) {
-        let h = ((mix(r.eid) << bits) >> shift) as usize;
-        let (w, sh) = (&mut filter[h >> 5], (h & 31) * 2);
-        let seen = (*w >> sh) & 1;
-        *w |= (1 | seen << 1) << sh;
-    }
-    let emit = |r: Ev, out: &mut Pool<Ev2>| {
-        if r.pay & VALID != 0 {
-            out.push((mix(r.person) >> (64 - bits)) as usize, Ev2 { person: r.person, ts: r.ts, pay: r.pay & !VALID });
-        }
-    };
-    suspects.clear();
-    for r in blocks.iter().flat_map(|b| b.iter()) {
-        let h = ((mix(r.eid) << bits) >> shift) as usize;
-        if (filter[h >> 5] >> ((h & 31) * 2)) & 2 != 0 {
-            suspects.push(*r);
-        } else {
-            emit(*r, out);
-        }
-    }
-    suspects.sort_unstable_by_key(|r| r.eid);
-    let mut k = 0;
-    while k < suspects.len() {
-        let mut best = suspects[k];
-        k += 1;
-        while k < suspects.len() && suspects[k].eid == best.eid {
-            if suspects[k].ingest < best.ingest {
-                best = suspects[k];
+    debug_assert!(keys.len() == pays.len() && keys.iter().zip(pays).all(|(k, p)| k.len() == p.len()));
+    dropped.clear();
+    dropped.resize(keys.len() << (10 - 6), 0);
+    if keys.len() > 1 << (POS_BITS - 10) {
+        dedup_big(keys, dropped);
+    } else {
+        // Lines of 16 slots at a load of 31-62%: a line is rarely full, and then the next one is probed.
+        let lines = (n / 10).next_power_of_two().max(2);
+        let lshift = 64 - lines.trailing_zeros();
+        table.clear();
+        table.resize(lines, TLine([0; 16]));
+        for (b, blk) in keys.iter().enumerate() {
+            for (j, r) in blk.iter().enumerate() {
+                let pos = (b << 10 | j) as u32;
+                // The partition took the top `bits` of the hash; the line takes the next ones, the tag 12 more.
+                let h = mix(r.eid) << bits;
+                let tag = ((h << (64 - lshift)) >> 52) as u32 | 1;
+                let mut li = (h >> lshift) as usize;
+                // In bounds: li is masked, positions come from this walk, and the table is never full.
+                unsafe {
+                    loop {
+                        let line = table.as_mut_ptr().add(li);
+                        let (mut found, empty) = probe(line, tag);
+                        while found != 0 {
+                            let s = found.trailing_zeros() as usize;
+                            let q = (*line).0[s] & POS_MASK;
+                            let other = keys.get_unchecked(q as usize >> 10).get_unchecked(q as usize & 1023);
+                            if other.eid == r.eid {
+                                let loser = if r.ingest < other.ingest {
+                                    (*line).0[s] = tag << POS_BITS | pos;
+                                    q
+                                } else {
+                                    pos
+                                };
+                                *dropped.get_unchecked_mut(loser as usize >> 6) |= 1 << (loser & 63);
+                                break;
+                            }
+                            found &= found - 1;
+                        }
+                        if found != 0 {
+                            break;
+                        }
+                        if empty != 0 {
+                            (*line).0[empty.trailing_zeros() as usize] = tag << POS_BITS | pos;
+                            break;
+                        }
+                        li = (li + 1) & (lines - 1);
+                    }
+                }
             }
-            k += 1;
         }
-        emit(best, out);
+    }
+    for (b, blk) in pays.iter().enumerate() {
+        for (j, e) in blk.iter().enumerate() {
+            let pos = b << 10 | j;
+            if e.person != 0 && dropped[pos >> 6] >> (pos & 63) & 1 == 0 {
+                out.push((mix(e.person) >> (64 - bits)) as usize, *e);
+            }
+        }
+    }
+}
+
+/// The slots of `line` holding `tag`, and the empty ones, as bit masks.
+#[inline(always)]
+unsafe fn probe(line: *const TLine, tag: u32) -> (u32, u32) {
+    #[cfg(target_feature = "avx2")]
+    unsafe {
+        use std::arch::x86_64::*;
+        let lo = _mm256_load_si256(line as *const __m256i);
+        let hi = _mm256_load_si256((line as *const __m256i).add(1));
+        let t = _mm256_set1_epi32((tag << POS_BITS) as i32);
+        let m = _mm256_set1_epi32(!POS_MASK as i32);
+        let f = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(_mm256_and_si256(lo, m), t))) as u32
+            | (_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(_mm256_and_si256(hi, m), t))) as u32) << 8;
+        let z = _mm256_setzero_si256();
+        let e = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(lo, z))) as u32
+            | (_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(hi, z))) as u32) << 8;
+        (f, e)
+    }
+    #[cfg(not(target_feature = "avx2"))]
+    unsafe {
+        let (mut f, mut e) = (0, 0);
+        for (s, &v) in (*line).0.iter().enumerate() {
+            f |= ((v >> POS_BITS == tag) as u32) << s;
+            e |= ((v == 0) as u32) << s;
+        }
+        (f, e)
+    }
+}
+
+/// A partition too large for 20-bit positions (over a million copies): every key sorted, losers marked.
+#[cold]
+fn dedup_big(keys: &[&[EvKey]], dropped: &mut Vec<u64>) {
+    let mut all: Vec<(Key, i64, usize)> = keys.iter().enumerate().flat_map(|(b, blk)| blk.iter().enumerate().map(move |(j, r)| (r.eid, r.ingest, b << 10 | j))).collect();
+    all.sort_unstable();
+    for w in all.windows(2) {
+        if w[0].0 == w[1].0 {
+            dropped[w[1].2 >> 6] |= 1 << (w[1].2 & 63);
+        }
     }
 }
 
