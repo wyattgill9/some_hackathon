@@ -4,9 +4,10 @@
 #[derive(Default)]
 pub struct Index {
     pub delims: Vec<u32>, // commas and newlines, in order
-    pub nl: Vec<u32>,
     qmask: Vec<u64>,   // per 64-byte block: the quote bits
     qprefix: Vec<u32>, // per block: quotes before it
+    nmask: Vec<u64>,   // the same for newlines
+    nprefix: Vec<u32>,
 }
 
 pub const SENTINELS: usize = 16;
@@ -16,35 +17,52 @@ impl Index {
     pub fn build(&mut self, buf: &[u8], n: usize) {
         assert!(buf.len() >= n + 64);
         self.delims.clear();
-        self.nl.clear();
-        self.qmask.clear();
-        self.qprefix.clear();
         self.delims.reserve(n / 6 + SENTINELS);
-        self.nl.reserve(n / 32 + 1);
-        self.qmask.reserve(n / 64 + 1);
-        self.qprefix.reserve(n / 64 + 1);
-        let (mut o, mut quotes) = (0, 0u32);
+        for v in [&mut self.qmask, &mut self.nmask] {
+            v.clear();
+            v.reserve(n / 64 + 2);
+        }
+        for v in [&mut self.qprefix, &mut self.nprefix] {
+            v.clear();
+            v.reserve(n / 64 + 2);
+        }
+        let (mut o, mut quotes, mut newlines) = (0, 0u32, 0u32);
         while o < n {
             let (d, l, q) = masks(&buf[o..o + 64]);
             let valid = if n - o >= 64 { u64::MAX } else { (1u64 << (n - o)) - 1 };
-            flatten::<12>(d & valid, o, &mut self.delims);
-            flatten::<4>(l & valid, o, &mut self.nl);
+            flatten::<10>(d & valid, o, &mut self.delims);
             self.qmask.push(q & valid);
             self.qprefix.push(quotes);
             quotes += (q & valid).count_ones();
+            self.nmask.push(l & valid);
+            self.nprefix.push(newlines);
+            newlines += (l & valid).count_ones();
             o += 64;
         }
+        // So the counts are defined at position n when n is a multiple of 64.
+        self.qmask.push(0);
+        self.qprefix.push(quotes);
+        self.nmask.push(0);
+        self.nprefix.push(newlines);
         self.delims.extend(std::iter::repeat_n(u32::MAX, SENTINELS));
-        self.nl.push(u32::MAX);
     }
 
     /// The number of quotes in `buf[..pos]`, for `pos` within the indexed data.
     #[inline(always)]
     pub fn quotes_before(&self, pos: usize) -> u32 {
-        // In bounds: pos < n, and both arrays hold an entry per 64-byte block of the data.
+        // In bounds: pos <= n, and both arrays hold an entry per 64-byte block of the data plus one.
         unsafe {
             let (b, i) = (pos >> 6, pos & 63);
             *self.qprefix.get_unchecked(b) + (*self.qmask.get_unchecked(b) & ((1u64 << i) - 1)).count_ones()
+        }
+    }
+
+    /// The number of newlines in `buf[..pos]`.
+    #[inline(always)]
+    pub fn newlines_before(&self, pos: usize) -> u32 {
+        unsafe {
+            let (b, i) = (pos >> 6, pos & 63);
+            *self.nprefix.get_unchecked(b) + (*self.nmask.get_unchecked(b) & ((1u64 << i) - 1)).count_ones()
         }
     }
 }
@@ -115,9 +133,9 @@ mod tests {
         let mut idx = Index::default();
         idx.build(&data, n);
         let want = |c: u8| -> Vec<u32> { (0..n).filter(|&i| data[i] == c).map(|i| i as u32).collect() };
-        assert_eq!(&idx.nl[..idx.nl.len() - 1], want(b'\n'));
-        for pos in 0..n {
+        for pos in 0..=n {
             assert_eq!(idx.quotes_before(pos) as usize, data[..pos].iter().filter(|&&c| c == b'"').count(), "{pos}");
+            assert_eq!(idx.newlines_before(pos) as usize, data[..pos].iter().filter(|&&c| c == b'\n').count(), "{pos}");
         }
         let mut d: Vec<u32> = want(b',');
         d.extend(want(b'\n'));
