@@ -30,4 +30,5 @@ FROM scratch
 COPY --from=build /pipeline /pipeline
 # The scorer runs as uid 1000 with a read-only root FS; the binary reads $DATA_DIR and writes only $OUTPUT_DIR.
 USER 1000:1000
+ENV SS_MMAP=1
 CMD ["/pipeline"]
