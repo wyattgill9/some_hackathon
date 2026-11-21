@@ -37,7 +37,7 @@ impl Index {
                 let o = b * 64;
                 let (d, l, q) = masks(&buf[o..o + 64]);
                 let valid = if n - o >= 64 { u64::MAX } else { (1u64 << (n - o)) - 1 };
-                len = flatten::<10>(d & valid, o, dp, len);
+                len = flatten::<8>(d & valid, o, dp, len);
                 qm.add(b).write(q & valid);
                 qp.add(b).write(quotes);
                 quotes += (q & valid).count_ones();
